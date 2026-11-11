@@ -1,0 +1,2874 @@
+// app.js v2 — DM企画サマリー（企画サマリー基盤＋履歴）
+(function () {
+  "use strict";
+  const M = window.MASTERS;
+  const S = window.Storage;
+  const DEFAULT_ROWS = 15;
+
+  const state = {
+    user: localStorage.getItem("dmplan:user") || "",
+    month: null, model: null, mtime: 0, editing: false, pollTimer: null,
+    sort: { field: "", dir: "asc" }, filters: {}, dragId: null, dragKey: null,
+    expanded: {}, showCode: false, showP3: true, showLP: false, showTest: false,
+    draggingMeasure: false, dragMeasure: null,
+    selected: new Set(), dragBatch: null, dragCanceled: false, dragFromSel: false, dragMoved: false,
+    dropOverId: null, dropAfter: false, dragCheckOn: null,
+    crossSelected: new Set(), crossDragCheckOn: null,
+    saveError: "", dirty: false,
+    tab: "list", schedOpen: {},
+    crossMonth: {},   // 施策名フィルター中に表示する過去月の比較データ（{month: {model,dirty,saving,timer}|null}）
+    crossExpanded: {},   // 過去月比較の展開状態（キー："month:id"）
+    moveLinesTogether: false,   // ONの間は縦線(データ入稿日・各共通線)をドラッグすると全部まとめて動く
+    baseline: null,   // 読み込み・直前の保存成功時点のスナップショット（保存時の3-way mergeの基準）
+  };
+  const cf = { data: [], cards: [], dots: [], sel: 0, dragMode: false, opening: false };
+  let saving = false, autoTimer = null, retryTimer = null;   // 自動保存の状態
+  const uid = () => "m" + Math.random().toString(36).slice(2, 9);
+
+  // 担当候補（この端末に保存。手入力で追加、×で削除）
+  const OWNERS_KEY = "dmplan:owners";
+  function getOwners() { try { const s = localStorage.getItem(OWNERS_KEY); if (s) return JSON.parse(s); } catch (e) {} return M.owners.slice(); }
+  function saveOwners(list) { localStorage.setItem(OWNERS_KEY, JSON.stringify(list)); rebuildOwnerDatalist(); }
+  function addOwner(v) { v = (v || "").trim(); if (!v) return; const l = getOwners(); if (!l.includes(v)) { l.push(v); saveOwners(l); } }
+  function removeOwner(v) { saveOwners(getOwners().filter(x => x !== v)); }
+  function rebuildOwnerDatalist() { const d = document.getElementById("dl-own"); if (!d) return; d.innerHTML = ""; getOwners().forEach(v => d.append(el("option", { value: v }))); }
+
+  // 数値を3桁カンマ整形（decimal=trueなら小数許容）。空は空。
+  function fmtNum(v, decimal) {
+    if (v === "" || v == null) return "";
+    let s = String(v).replace(/,/g, "");
+    if (s === "" || s === ".") return s;
+    if (decimal) {
+      const parts = s.split(".");
+      const intp = parts[0] === "" ? "" : Number(parts[0]).toLocaleString();
+      if (parts.length > 1) { const num = parseFloat(s); if (!isNaN(num)) return num.toFixed(1); }   // 小数第1位まで表示
+      return intp;
+    }
+    const n = parseInt(s, 10); return isNaN(n) ? "" : n.toLocaleString();
+  }
+
+  // 保存日時の表示
+  function formatDT(iso) { if (!iso) return ""; const d = new Date(iso); const p = n => String(n).padStart(2, "0"); return `${d.getFullYear()}/${p(d.getMonth()+1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; }
+  function updateSavedAt() {
+    const e = $("#savedAt"); if (!e) return;
+    if (saving) { e.className = "saved-at saving"; e.textContent = "保存中…"; return; }
+    if (state.saveError) { e.className = "saved-at err"; e.textContent = "⚠ 保存できません：" + state.saveError; e.title = state.saveError; return; }
+    if (state.model && state.model.updatedAt) { e.className = "saved-at ok"; e.textContent = `✓ 最終保存 ${formatDT(state.model.updatedAt)}${state.model.updatedBy ? "（" + state.model.updatedBy + "）" : ""}`; }
+    else { e.className = "saved-at"; e.textContent = state.editing ? "「保存」ボタンで保存します" : ""; }
+  }
+
+  function emptyCond() {
+    return { products: [], ages: ["50代","60代","70代","80代","不明"], dUse: true, dFrom: 3, dTo: 8,
+      rUse: false, rFrom: 1, rTo: 8, f: ["F1","F2以上"], gender: "不問", mailArea: false, birthMonth: false, note: "" };
+  }
+  function emptyExcl() {
+    const common = {}; M.exclCommon.forEach(e => common[e.key] = true);
+    const per = {}; M.exclPerMeasure.forEach(e => per[e.key] = false);
+    return { common, zengetsuMode: "全て", per };
+  }
+  function emptyMeasure() {
+    return { id: uid(), baseName: "", owner: "", category: "DMB", runStatus: "未確定", codeStatus: "未確定", num: "",
+      kind: "RO", variant: "", media: "発送DM", listMethod: "AI", delivery: "100", lp: "×", p3: "", priority: "",
+      estimatedCount: "", products: "", benefit: "", note: "", roFixDate: "", officialName: "",
+      supplement: "", remark: "", origCode1: "", origCode2: "", spec: "Z圧着", printerNote: "",
+      compareBaseId: "", compareScope: "", testValidated: false, highlight: false, cond: emptyCond(), excl: emptyExcl(),
+      cancelled: false, cancelDate: "", cancelReason: "", reallocateToId: "", reallocateCount: "" };
+  }
+  function emptySchedule() { return { gates: {}, listGate: ["", "", "", ""], kickoff: { due: "", items: ["", "", "", ""], open: true }, overrides: {}, done: {}, notes: {}, custom: [] }; }
+  function emptyModel(month) {
+    const active = []; for (let i = 0; i < DEFAULT_ROWS; i++) active.push(emptyMeasure());
+    return { month, title: window.monthLabel(month) + "DM施策", updatedAt: "", updatedBy: "", mailDate: "",
+      designAxis: "", tciAxis: "", schedule: emptySchedule(),
+      active, carryNext: [], carryFuture: [], ideas: [] };
+  }
+  // ===== 保存時の3-way merge（同時アクセスが多くても、違う場所の編集同士なら潰し合わないようにする） =====
+  // baseline＝自分が読み込んだ（前回保存に成功した）時点、local＝今の自分の編集内容、disk＝保存直前に読み直した共有フォルダの最新内容。
+  // 「自分がbaselineから変更した部分はローカル優先、変更していない部分は最新のdisk側を採用」という方針で、
+  // 別の人が別の場所を編集していれば両方の変更が残るようにする（同じ場所を両方が編集した場合は、後から保存した方が勝つ＝仕様として許容）。
+  function mergeArrayById(baseline, local, disk) {
+    const bMap = new Map((baseline || []).map(x => [x.id, x]));
+    const dMap = new Map((disk || []).map(x => [x.id, x]));
+    const result = []; const usedIds = new Set();
+    (local || []).forEach(item => {
+      usedIds.add(item.id);
+      const b = bMap.get(item.id);
+      const changed = !b || JSON.stringify(b) !== JSON.stringify(item);
+      const d = dMap.get(item.id);
+      if (changed) result.push(item);        // 自分がbaselineから変更(追加/編集)した行→自分の版を残す
+      else if (d) result.push(d);             // 変更していない行→最新のdisk版を採用（他の人の更新を取り込む）
+      else if (!b) result.push(item);         // 通常起きないはずのフォールバック
+      // else：変更なし＆disk側で削除済み→何もpushしない（他の人の削除を反映）
+    });
+    // disk側にしかない項目（baselineの時点でも自分は持っていなかった＝他の人が新規追加した行）を取り込む
+    (disk || []).forEach(d => { if (!usedIds.has(d.id) && !bMap.has(d.id)) result.push(d); });
+    return result;
+  }
+  function mergeField(baseline, local, disk, key) {
+    const changed = JSON.stringify(baseline ? baseline[key] : undefined) !== JSON.stringify(local ? local[key] : undefined);
+    if (changed || !disk) return local ? local[key] : undefined;
+    return key in disk ? disk[key] : local[key];
+  }
+  // フラットな連想配列（キー→値）の3-way merge。schedule.overrides/done/notes/gatesに使う
+  function mergeMapByKey(baseline, local, disk) {
+    const b = baseline || {}, l = local || {}, d = disk || {};
+    const result = {};
+    new Set([...Object.keys(l), ...Object.keys(d)]).forEach(k => {
+      if (k in l) {
+        const changed = JSON.stringify(b[k]) !== JSON.stringify(l[k]);
+        result[k] = (changed || !(k in d)) ? l[k] : d[k];
+      } else if (k in d && !(k in b)) {
+        result[k] = d[k];   // 他の人が新規追加したキー
+      }
+      // else：ローカルで削除済み＆baselineに存在＝他の人側の値は無視して削除を反映
+    });
+    return result;
+  }
+  function mergeModels(baseline, local, disk) {
+    const merged = JSON.parse(JSON.stringify(local));
+    ["active", "carryNext", "carryFuture"].forEach(k => { merged[k] = mergeArrayById(baseline[k], local[k], disk[k]); });
+    ["title", "mailDate", "designAxis", "tciAxis"].forEach(f => { merged[f] = mergeField(baseline, local, disk, f); });
+    const bs = baseline.schedule || {}, ls = local.schedule || {}, ds = disk.schedule || {};
+    merged.schedule = {
+      gates: mergeMapByKey(bs.gates, ls.gates, ds.gates),
+      listGate: mergeField(bs, ls, ds, "listGate"),
+      kickoff: mergeField(bs, ls, ds, "kickoff"),
+      overrides: mergeMapByKey(bs.overrides, ls.overrides, ds.overrides),
+      done: mergeMapByKey(bs.done, ls.done, ds.done),
+      notes: mergeMapByKey(bs.notes, ls.notes, ds.notes),
+      custom: mergeArrayById(bs.custom, ls.custom, ds.custom),
+    };
+    return merged;
+  }
+  // mergeの結果を「いま画面が掴んでいるオブジェクトの中身だけ差し替える」形で反映する。
+  // state.model = merged のように入れ替えると、各入力欄のイベントハンドラ（件数・P3/List・郵便割合・
+  // 詳細パネル等は行オブジェクトを直接掴んでいる）が古いオブジェクトに取り残され、そこへ入力した値が
+  // state.modelに入らないまま「保存済み」になり、次の再描画で入力前の値に戻ってしまう。
+  // id付きの配列は要素の参照も維持する（開いているポップアップやドラッグ中の参照も生き残る）。
+  function syncArrayInPlace(target, src) {
+    const idable = a => a.every(x => x && typeof x === "object" && x.id);
+    if (!idable(target) || !idable(src)) { target.length = 0; target.push(...src); return; }
+    const byId = new Map(target.map(o => [o.id, o]));
+    const next = src.map(s => { const t = byId.get(s.id); if (!t || t === s) return s; syncObjectInPlace(t, s); return t; });
+    target.length = 0; target.push(...next);
+  }
+  function syncObjectInPlace(target, src) {
+    if (target === src) return;
+    Object.keys(target).forEach(k => { if (!(k in src)) delete target[k]; });
+    Object.keys(src).forEach(k => {
+      const sv = src[k], tv = target[k];
+      if (Array.isArray(sv) && Array.isArray(tv)) syncArrayInPlace(tv, sv);
+      else if (sv && tv && typeof sv === "object" && typeof tv === "object" && !Array.isArray(sv) && !Array.isArray(tv)) syncObjectInPlace(tv, sv);
+      else target[k] = sv;
+    });
+  }
+  // 全角で打った数字（１０００など）を捨てずに半角へ直す。IMEをONのまま数値欄に入力しても消えないようにする
+  function toHalfWidthNum(v) {
+    return String(v == null ? "" : v)
+      .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+      .replace(/[．。]/g, ".");
+  }
+  // 旧データ互換：欠けフィールドを補完
+  function normalize(m) {
+    ["active","carryNext","carryFuture"].forEach(k => (m[k]||[]).forEach(x => {
+      if (!x.cond) x.cond = emptyCond();
+      if (!x.excl) x.excl = emptyExcl();
+      if (!x.codeStatus) x.codeStatus = x.num ? "確定" : "未確定";
+      if (!x.runStatus) x.runStatus = "未確定";
+      if (x.p3 == null) x.p3 = "";
+      if (x.compareBaseId == null) x.compareBaseId = "";
+      if (x.compareScope == null) x.compareScope = "";
+      if (x.officialName == null) x.officialName = "";
+      if (x.testValidated == null) x.testValidated = false;
+      if (x.highlight == null) x.highlight = false;
+      if (!x.spec) x.spec = "Z圧着";
+      if (x.printerNote == null) x.printerNote = "";
+      if (x.remark == null) x.remark = "";
+      if (x.cancelled == null) x.cancelled = false;
+      if (x.cancelDate == null) x.cancelDate = "";
+      if (x.cancelReason == null) x.cancelReason = "";
+      if (x.reallocateToId == null) x.reallocateToId = "";
+      if (x.reallocateCount == null) x.reallocateCount = "";
+      // 旧データ互換：送付方法(選択式)→郵便割合(%)へ移行
+      if (x.delivery === "郵便のみ" || x.delivery == null || x.delivery === "") x.delivery = "100";
+      else if (x.delivery === "メール便のみ") x.delivery = "0";
+      else if (x.delivery === "郵便+メール便") x.delivery = "90";
+      if (!x.lp) x.lp = "×";
+    }));
+    // 旧仕様（件数の手入力・自動0化/合算なし）で保存された中止済みデータの自己修復：
+    // 中止済みなのに想定件数がまだ0になっていない場合、振替先へ実際に加算してから0にする（初回のみ・以後は0のためスキップされる）
+    (m.active || []).forEach(x => {
+      const amt = parseInt(x.estimatedCount, 10) || 0;
+      if (x.cancelled && x.reallocateToId && amt > 0) {
+        const dest = (m.active || []).find(d => d.id === x.reallocateToId);
+        if (dest) dest.estimatedCount = String((parseInt(dest.estimatedCount, 10) || 0) + amt);
+        x.reallocateCount = String(amt);
+        x.estimatedCount = "0";
+      }
+    });
+    if (!m.ideas) m.ideas = [];
+    if (m.mailDate == null) m.mailDate = "";
+    if (m.designAxis == null) m.designAxis = "";
+    if (m.tciAxis == null) m.tciAxis = "";
+    if (!m.schedule) m.schedule = emptySchedule();
+    if (!m.schedule.gates) m.schedule.gates = {};
+    if (!m.schedule.listGate) m.schedule.listGate = ["", "", "", ""];
+    if (!m.schedule.kickoff) m.schedule.kickoff = { due: "", items: ["", "", "", ""], open: true };
+    if (!m.schedule.overrides) m.schedule.overrides = {};
+    if (!m.schedule.done) m.schedule.done = {};
+    if (!m.schedule.notes) m.schedule.notes = {};
+    if (!m.schedule.custom) m.schedule.custom = [];
+    // 旧データ互換：「今後へ持越し」セクションと自由記述の「アイデア候補」を廃止し、
+    // 「次月持越し」＝アイデア欄に合流させる（1回だけ・以後は両方空のまま）
+    if (!m.carryNext) m.carryNext = [];
+    if (m.carryFuture && m.carryFuture.length) {
+      m.carryNext.push(...m.carryFuture);
+      m.carryFuture = [];
+    }
+    if (m.ideas && m.ideas.length) {
+      m.ideas.forEach(it => { if (it.text && it.text.trim()) { const em = emptyMeasure(); em.baseName = it.text.trim(); m.carryNext.push(em); } });
+      m.ideas = [];
+    }
+    return m;
+  }
+
+  // RO/テストの版ラベルを自動採番：同一施策名(baseName)・同一種別が1本なら「RO」、2本以上なら「RO①②」。テストも同様。
+  const CIRCLED = n => (n >= 1 && n <= 20) ? String.fromCharCode(0x2460 + n - 1) : ("#" + n);
+  function kindLabel(m) {
+    if (!m.baseName) return m.kind;
+    const key = sectionOf(m);
+    const grp = state.model[key].filter(x => x.baseName === m.baseName && x.kind === m.kind);
+    if (grp.length <= 1) return m.kind;
+    const i = grp.indexOf(m);
+    return m.kind + CIRCLED(i + 1);
+  }
+  function derive(m, month) {
+    const prefix = window.prefixOfCategory(m.category);
+    const hasNum = m.num !== "" && m.num != null;              // 番号が入っていればコードを候補として表示
+    const confirmed = m.codeStatus === "確定" && hasNum;
+    const label = kindLabel(m);                                 // RO / RO① / テスト …（自動採番）
+    // 正式名（＝案件共有シートに貼れる施策名候補）。officialName（持ち帰り）があれば最優先。
+    const working = window.buildFullName({ month, baseName: m.baseName, media: m.media, variant: label, prefix, num: m.num, confirmed: hasNum });
+    return {
+      confirmed,
+      materialCode: hasNum ? window.buildMaterialCode(prefix, m.num) : "未確定",
+      fullName: (m.officialName && m.officialName.trim()) ? m.officialName.trim() : working,
+    };
+  }
+
+  // ============ DOM helpers ============
+  const $ = s => document.querySelector(s);
+  const el = (t, a = {}, ...k) => {
+    const e = document.createElement(t);
+    for (const [key, v] of Object.entries(a)) {
+      if (key === "class") e.className = v;
+      else if (key === "html") e.innerHTML = v;
+      else if (key.startsWith("on") && typeof v === "function") e.addEventListener(key.slice(2), v);
+      else if (v != null) e.setAttribute(key, v);
+    }
+    for (const c of k) if (c != null) e.append(c.nodeType ? c : document.createTextNode(c));
+    return e;
+  };
+  function icon(name){ return el("i", { class: "ti ti-" + name, "aria-hidden": "true" }); }
+  function dl(id, items){ if(document.getElementById(id))return; const d=el("datalist",{id}); items.forEach(v=>d.append(el("option",{value:v}))); document.body.append(d); }
+
+  // ============ Header / month ============
+  function renderHeader() {
+    $("#folderStatus").textContent = S.isConnected() ? S.folderName()
+      : (S.supported ? "未接続（共有フォルダに接続してください）" : "フォルダ直結 非対応ブラウザ（Edge/Chrome推奨）");
+    $("#folderStatus").className = "folder-status " + (S.isConnected() ? "on" : "off");
+    $("#userName").value = state.user;
+  }
+  async function renderMonthSelect() {
+    const sel = $("#monthSelect"); sel.innerHTML = "";
+    if (!S.isConnected()) { sel.append(el("option", { value: "" }, "（未接続）")); return; }
+    const months = await S.listMonths();
+    if (!months.length) sel.append(el("option", { value: "" }, "（データなし）"));
+    months.forEach(m => sel.append(el("option", { value: m }, window.monthLabel(m))));
+    if (state.month && months.includes(state.month)) sel.value = state.month;
+  }
+  // 閲覧/編集モードは廃止し、常に編集可能にする（共有フォルダに接続・お名前が入っていれば自動で編集状態）。
+  // ロックは他の人が同時に開いているかもしれない、という情報表示のみに使う
+  async function renderLockBar() {
+    const note = $("#lockNote");
+    if (note) { note.textContent = ""; note.className = "lock-note"; }
+    if (!S.isConnected()) {
+      if (note) { note.className = "lock-note"; note.append(icon("folder"), " 共有フォルダに接続してください"); }
+      document.body.classList.add("readonly"); return;
+    }
+    const lock = state.month ? await S.readLock(state.month) : null;
+    const mine = lock && lock.user === state.user;
+    if (lock && !mine && note) { note.className = "lock-note"; note.append(icon("users"), ` ${lock.user} さんも編集中の可能性があります（同時編集にご注意ください）`); }
+    document.body.classList.toggle("readonly", !state.editing);
+  }
+  function renderSummary() {
+    const box = $("#summary"); if (!state.model) { box.innerHTML = ""; return; }
+    // 名前が入っている施策だけを集計（実施○×には依存しない）
+    const a = state.model.active.filter(m => m.baseName && m.baseName.trim());
+    const live = a.filter(m => !m.cancelled);   // 中止した施策は施策数・RO/テスト本数の集計から除外
+    const ro = live.filter(m => m.kind === "RO").length, test = live.filter(m => m.kind === "テスト").length;
+    const cnt = a.reduce((s, m) => s + (parseInt(m.estimatedCount, 10) || 0), 0);
+    box.innerHTML = "";
+    const chipEl = (l, v) => el("div", { class: "chip" }, el("span", { class: "chip-v" }, String(v)), el("span", { class: "chip-l" }, l));
+    box.append(chipEl("施策数（全体）", live.length), chipEl("RO本数", ro), chipEl("テスト本数", test), chipEl("想定件数 合計", cnt.toLocaleString()));
+    box.append(el("div", { class: "sum-spacer" }));
+    // 今月実施セクションの操作（見出しを廃止したのでここに集約）
+    const tools = el("div", { class: "sum-tools" });
+    const anyFilter = ["baseName","owner","kind","listMethod","delivery","lp"].some(f => state.filters[f] != null);
+    if (state.sort.field || anyFilter) tools.append(el("button", { class: "btn small ghost", title: "並び替え・絞り込みを解除", onclick: () => { state.sort = { field: "", dir: "asc" }; state.filters = {}; rerender(); } }, icon("filter-off"), " 解除"));
+    tools.append(el("button", { class: "btn small toggle" + (state.showP3 ? " on" : ""), title: state.showP3 ? "P3/List・優先 を非表示" : "P3/List・優先 を表示", onclick: () => { state.showP3 = !state.showP3; rerender(); } }, icon(state.showP3 ? "eye" : "eye-off"), " P3/List・優先"));
+    tools.append(el("button", { class: "btn small toggle" + (state.showCode ? " on" : ""), title: state.showCode ? "素材コード を非表示" : "素材コード を表示", onclick: () => { state.showCode = !state.showCode; rerender(); } }, icon(state.showCode ? "eye" : "eye-off"), " 素材コード"));
+    tools.append(el("button", { class: "btn small toggle" + (state.showLP ? " on" : ""), title: state.showLP ? "LP作成 を非表示" : "LP作成 を表示", onclick: () => { state.showLP = !state.showLP; rerender(); } }, icon(state.showLP ? "eye" : "eye-off"), " LP"));
+    tools.append(el("button", { class: "btn small toggle" + (state.showTest ? " on" : ""), title: state.showTest ? "テスト検証 を非表示" : "テスト検証 を表示", onclick: () => { state.showTest = !state.showTest; rerender(); } }, icon(state.showTest ? "eye" : "eye-off"), " テスト検証"));
+    tools.append(el("button", { class: "btn small", onclick: sortByPriority, title: "AI・既ロの区別なく、P3/Listが高い順に優先度1から振ります。押した瞬間のP3/List値で計算するため、値を全部入力し終えてから押してください（後からP3/Listを直した場合は、もう一度押すと再計算されます）" }, "P3/Listで優先度を設定"));
+    tools.append(el("button", { class: "btn small ghost", title: "表示中の順に、正式名を1行1施策でコピー（案件共有シートへそのまま貼り付け可）", onclick: copyAllOfficialNames }, icon("copy"), " 正式名を一括コピー"));
+    tools.append(el("button", { class: "btn small ghost", title: "表示中の順に、想定件数を1行1施策でコピー", onclick: copyAllCounts }, icon("copy"), " 件数を一括コピー"));
+    tools.append(el("button", { class: "btn small ghost", title: "表示中の順に、担当を1行1施策でコピー", onclick: copyAllOwners }, icon("copy"), " 担当を一括コピー"));
+    box.append(tools, el("span", { id: "savedAt", class: "saved-at" }));
+    updateSavedAt();
+  }
+
+  // ============ 施策テーブル ============
+  // 列定義（f=フィールド, type=ソート/フィルタの型, cat=カテゴリ絞り込み対象）
+  const COLS = [
+    { t: "No." }, { t: "" },
+    { t: "施策名", f: "baseName", type: "cat" },
+    { t: "担当", f: "owner", type: "cat" },
+    { t: "種別", f: "kind", type: "cat" },
+    { t: "取得", f: "listMethod", type: "cat" },
+    { t: "郵便割合", title: "郵便で発送する割合（％）。手入力（残りはメール便扱い）", f: "delivery", type: "num" },
+    { t: "P3/List", title: "P3/List", f: "p3", type: "num", hideGroup: "p3" },
+    { t: "優先", f: "priority", type: "num", hideGroup: "p3" },
+    { t: "件数", title: "想定件数", f: "estimatedCount", type: "num" },
+    { t: "素材コード", key: "code", hideGroup: "code", title: "素材コード（正式名の候補）" },
+    { t: "正式名（編集可）" },
+    { t: "LP", title: "LP作成（○＝作る／×＝作らない）", f: "lp", type: "cat", hideGroup: "lp" },
+    { t: "テスト検証", hideGroup: "test" },
+    { t: "" },
+  ];
+  function passFilters(m) {
+    for (const f of ["baseName", "owner", "kind", "listMethod", "delivery", "lp"]) {
+      const allow = state.filters[f];
+      if (allow != null && !allow.includes(m[f] || "")) return false;
+    }
+    return true;
+  }
+  function sortView(rows) {
+    const { field, dir } = state.sort; if (!field) return rows;
+    const num = ["p3", "priority", "estimatedCount", "delivery"].includes(field);
+    const val = m => num ? (parseFloat(m[field]) || 0) : String(m[field] || "");
+    const r = rows.slice().sort((a, b) => { const x = val(a), y = val(b); return (x < y ? -1 : x > y ? 1 : 0) * (dir === "desc" ? -1 : 1); });
+    return r;
+  }
+  // 一部の列は既定で非表示（トグルで表示）
+  function colVisible(c) {
+    if (c.hideGroup === "code") return state.showCode;
+    if (c.hideGroup === "p3") return state.showP3;
+    if (c.hideGroup === "lp") return state.showLP;
+    if (c.hideGroup === "test") return state.showTest;
+    return true;
+  }
+  function activeCols() { return COLS.filter(colVisible); }
+  function renderMeasureSection(key, label, icn) {
+    const list = state.model[key];
+    const wrap = el("section", { class: "sec" });
+    // 今月実施(active)は見出しを廃止（集計バーに統合）。持越しセクションのみ見出しを表示
+    if (key !== "active") {
+      const head = el("div", { class: "sec-head" }, el("h2", {}, icon(icn), " " + label, el("span", { class: "sec-count" }, `${list.length}`)));
+      const anyFilter = ["baseName","owner","kind","listMethod","delivery","lp"].some(f => state.filters[f] != null);
+      if (state.sort.field || anyFilter) head.append(el("button", { class: "btn small ghost", title: "並び替え・絞り込みを解除", onclick: () => { state.sort = { field: "", dir: "asc" }; state.filters = {}; rerender(); } }, icon("filter-off"), " 解除"));
+      wrap.append(head);
+    }
+    const table = el("table", { class: "grid" });
+    const thr = el("tr", {});
+    activeCols().forEach(c => thr.append(headerCell(c)));
+    table.append(el("thead", {}, thr));
+    const tb = el("tbody", {});
+    const { live, all: rows } = orderedRows(key);
+    rows.forEach((m, i) => {
+      // 中止済みは番号を振らず最後尾へ寄せる。実施中の並びが終わる境目に少し隙間を空ける
+      if (m.cancelled && i === live.length) tb.append(el("tr", { class: "cancelled-gap-row" }, el("td", { colspan: String(activeCols().length) })));
+      const bn = (m.baseName || "").trim();
+      const next = rows[i + 1];
+      // 同じ施策名のかたまりの最後の行に、太めのグレー線で区切りを付ける（展開中の行は行内の色帯を優先し区切り線は付けない）
+      const isGroupEnd = bn && (!next || (next.baseName || "").trim() !== bn);
+      const tr = row(key, m);
+      if (isGroupEnd && !state.expanded[m.id]) tr.classList.add("group-end");
+      tb.append(tr);
+      if (state.expanded[m.id]) tb.append(detailRow(key, m));
+    });
+    if (rows.length === 0) tb.append(el("tr", {}, el("td", { colspan: String(activeCols().length), class: "muted", style: "padding:10px" }, "該当する施策がありません")));
+    table.append(tb);
+    wrap.append(el("div", { class: "grid-scroll" }, table));
+    wrap.append(el("div", { class: "add-bottom" }, el("button", { class: "btn small ghost", onclick: () => { list.push(emptyMeasure()); markDirty(); rerender(); } }, icon("plus"), " 施策を追加")));
+    // セクションの空きスペースへドロップ＝この末尾へ移動（別セクションからでも可）
+    wrap.addEventListener("dragover", e => { if (state.draggingMeasure) { e.preventDefault(); wrap.classList.add("drop-target"); } });
+    wrap.addEventListener("dragleave", e => { if (!wrap.contains(e.relatedTarget)) wrap.classList.remove("drop-target"); });
+    wrap.addEventListener("drop", e => { e.preventDefault(); wrap.classList.remove("drop-target"); handleRowDrop(key, null); });
+    return wrap;
+  }
+  // 見出しセル（ソート/フィルタ対応列はクリックでメニュー）
+  function headerCell(c) {
+    if (!c.f) return el("th", c.title ? { title: c.title } : {}, c.t);
+    const active = state.sort.field === c.f;
+    const filtered = state.filters[c.f] != null;
+    const th = el("th", { class: "th-menu" + (active || filtered ? " on" : "") });
+    const btn = el("button", { class: "th-btn", title: c.title || c.t }, c.t);
+    if (active) btn.append(el("span", { class: "th-ind" }, state.sort.dir === "desc" ? " ▼" : " ▲"));
+    if (filtered) btn.append(el("span", { class: "th-ind" }, " ⛃"));
+    btn.addEventListener("click", e => { e.stopPropagation(); openColMenu(c, th); });
+    th.append(btn);
+    return th;
+  }
+  function closeColMenu() { const m = document.getElementById("colMenu"); if (m) m.remove(); document.removeEventListener("click", closeColMenu); }
+  function openColMenu(c, th) {
+    closeColMenu();
+    const menu = el("div", { id: "colMenu", class: "col-menu" });
+    const setSort = dir => { state.sort = { field: c.f, dir }; closeColMenu(); rerender(); };
+    menu.append(el("button", { class: "cm-item", onclick: () => setSort("asc") }, c.type === "num" ? "▲ 小さい順（昇順）" : "▲ 昇順"));
+    menu.append(el("button", { class: "cm-item", onclick: () => setSort("desc") }, c.type === "num" ? "▼ 大きい順（降順）" : "▼ 降順"));
+    if (c.type === "cat") {
+      menu.append(el("div", { class: "cm-sep" }, "表示する値"));
+      const vals = [...new Set(state.model.active.concat(state.model.carryNext, state.model.carryFuture).map(m => m[c.f] || "").filter(v => v !== ""))];
+      const cur = state.filters[c.f] || vals.slice();
+      const checks = [];
+      const setAll = (allOn) => (e) => {
+        e.stopPropagation();
+        state.filters[c.f] = allOn ? null : [];
+        checks.forEach(({ b, v }) => { b.classList.toggle("on", allOn); b.textContent = (allOn ? "☑ " : "☐ ") + v; });
+        rerender();
+      };
+      menu.append(el("div", { class: "cm-btnrow" },
+        el("button", { class: "cm-mini", onclick: setAll(true) }, "☑ 全て選択"),
+        el("button", { class: "cm-mini", onclick: setAll(false) }, "☐ 全て外す")));
+      vals.forEach(v => {
+        const on = cur.includes(v);
+        const b = el("button", { class: "cm-check" + (on ? " on" : ""), onclick: (e) => {
+          e.stopPropagation();
+          let arr = (state.filters[c.f] || vals.slice()).slice();
+          const nowOn = !arr.includes(v);
+          if (arr.includes(v)) arr = arr.filter(x => x !== v); else arr.push(v);
+          state.filters[c.f] = (arr.length === vals.length) ? null : arr;
+          // メニューは document.body 直下にあり rerender() では再描画されないため、このボタン自身の表示を直接更新する
+          b.classList.toggle("on", nowOn);
+          b.textContent = (nowOn ? "☑ " : "☐ ") + v;
+          rerender();
+        } }, (on ? "☑ " : "☐ ") + v);
+        checks.push({ b, v });
+        menu.append(b);
+      });
+    }
+    // 担当列：候補（サジェスト）の管理
+    if (c.f === "owner") {
+      menu.append(el("div", { class: "cm-sep" }, "担当の候補を編集（×で削除）"));
+      getOwners().forEach(v => {
+        const rowb = el("div", { class: "cm-owner" }, el("span", {}, v),
+          el("button", { class: "cm-x", title: "候補から削除", onclick: (e) => { e.stopPropagation(); removeOwner(v); openColMenu(c, th); } }, "×"));
+        menu.append(rowb);
+      });
+    }
+    // 位置
+    const r = th.getBoundingClientRect();
+    menu.style.left = Math.min(r.left, window.innerWidth - 220) + "px";
+    menu.style.top = (r.bottom + 2) + "px";
+    document.body.append(menu);
+    setTimeout(() => document.addEventListener("click", closeColMenu), 0);
+  }
+  function field(m, f, attrs = {}) { return el("input", Object.assign({ value: m[f] ?? "", "data-id": m.id, "data-field": f }, attrs)); }
+  // Excelから複数セル分を貼り付け＝貼り付けたセルから下の行へ一気に反映（先頭セルにペースト）
+  // apply(row, その行に貼り付けられた1行分の生テキスト) で、行への反映のしかたを呼び出し側が決める
+  function attachFillDownPaste(inp, m, apply) {
+    inp.addEventListener("paste", e => {
+      const txt = ((e.clipboardData || window.clipboardData) || {}).getData ? (e.clipboardData || window.clipboardData).getData("text") : "";
+      if (!txt) return;
+      const lines = txt.replace(/\r\n?/g, "\n").split("\n");
+      while (lines.length && lines[lines.length - 1].trim() === "") lines.pop();
+      if (lines.length <= 1) return;   // 単一値は通常の貼り付けに任せる
+      // 過去月比較パネルの行は当月のモデルに属さない。ここで連続貼り付けすると当月の行を書き換えてしまうため、
+      // その欄だけの通常の貼り付けに任せる
+      if (!findMeasure(m.id)) return;
+      e.preventDefault();
+      if (!state.editing) return;
+      const key = sectionOf(m);
+      const rows = sortView(state.model[key].filter(passFilters));
+      let start = rows.findIndex(x => x.id === m.id); if (start < 0) start = 0;
+      let filled = 0;
+      for (let i = 0; i < lines.length && start + i < rows.length; i++) { apply(rows[start + i], lines[i]); filled++; }
+      markDirty(); rerender();
+      const over = lines.length - filled;
+      flash(`${filled}件を貼り付けました` + (over > 0 ? `（行が${over}件不足：先に行を追加してください）` : ""));
+    });
+  }
+  // 数値入力：半角のみ・3桁カンマ表示（フォーカス中は生値、離すと整形）。#board の汎用リスナは通さず直接保存。
+  function numField(m, f, decimal, cls) {
+    const inp = el("input", { class: cls, inputmode: decimal ? "decimal" : "numeric", value: fmtNum(m[f], decimal), placeholder: decimal ? "—" : "0" });
+    inp.addEventListener("focus", () => { inp.value = (m[f] ?? "") === "" ? "" : String(m[f]).replace(/,/g, ""); });
+    const take = () => {
+      let raw = toHalfWidthNum(inp.value).replace(decimal ? /[^0-9.]/g : /[^0-9]/g, "");
+      if (decimal) { const p = raw.split("."); raw = p.shift() + (p.length ? "." + p.join("") : ""); }
+      m[f] = raw;
+      if (f === "estimatedCount") renderSummary();
+      return raw;
+    };
+    // 日本語入力の変換中（isComposing）に値を取り込むと、確定前の文字を数字でないとして捨ててしまい、
+    // 全角で入力した数値が消える。変換が確定してから取り込み、半角に直した値を欄にも反映する。
+    inp.addEventListener("input", e => { if (e.isComposing) return; take(); });
+    inp.addEventListener("compositionend", () => { const raw = take(); if (inp.value !== raw) inp.value = raw; });
+    inp.addEventListener("blur", () => { inp.value = fmtNum(m[f], decimal); });
+    attachFillDownPaste(inp, m, (row, raw) => {
+      let v = String(raw).split("\t")[0].replace(decimal ? /[^0-9.]/g : /[^0-9]/g, "");
+      if (decimal) { const p = v.split("."); v = p.shift() + (p.length ? "." + p.join("") : ""); }
+      row[f] = v;
+    });
+    return inp;
+  }
+  // 郵便割合（％）：半角数字のみ・0〜100にクランプ。複数選択中は他の数値項目と同様に一括反映。
+  function deliveryField(m) {
+    const wrap = el("div", { class: "delivery-field" });
+    const inp = el("input", { class: "w-souf", inputmode: "numeric", value: m.delivery ?? "100", placeholder: "100", title: "郵便で発送する割合（％）。残りはメール便扱い（手入力）" });
+    const clamp = raw => { const v = toHalfWidthNum(raw).replace(/[^0-9]/g, ""); return v === "" ? "" : String(Math.min(100, parseInt(v, 10))); };
+    // 変換中に inp.value を書き換えるとIMEの変換が壊れて入力できなくなるため、確定後だけ整形する
+    const takeDlv = () => { const v = clamp(inp.value); if (inp.value !== v) inp.value = v; m.delivery = v; };
+    inp.addEventListener("input", e => { if (e.isComposing) return; takeDlv(); });
+    inp.addEventListener("compositionend", takeDlv);
+    inp.addEventListener("change", () => {
+      const n = applyToSelection(m, "delivery", inp.value);
+      if (n > 1) { rerender(); flash(`選択中の${n}件をまとめて変更しました`); }
+    });
+    attachFillDownPaste(inp, m, (row, raw) => { row.delivery = clamp(String(raw).split("\t")[0].trim()); });
+    wrap.append(inp, el("span", { class: "pct-suffix" }, "%"));
+    return wrap;
+  }
+  function pick(m, f, opts, attrs = {}) {
+    const s = el("select", Object.assign({ "data-id": m.id, "data-field": f }, attrs));
+    const cur = m[f] ?? "";
+    // 現在の値が選択肢に無い場合（例：旧データの「手動」等）、無言でAI/既ロ扱いにならないよう、その値のまま選べる選択肢を足す
+    if (cur !== "" && !opts.some(o => (o.value ?? o) === cur)) s.append(el("option", { value: cur }, cur + "（旧データ）"));
+    opts.forEach(o => { const v = o.value ?? o, l = o.label ?? o; const op = el("option", { value: v }, l); if (cur === v) op.selected = true; s.append(op); });
+    return s;
+  }
+  // 施策名の候補（定番＋入力済みの実データ）
+  function baseSuggestions() {
+    const base = ["お誕生日", "TRS下取", "TRS下取りお誕生日", "TRS下取WOW", "RAH買い替え", "RAH買い替えお誕生日", "複数掲載", "お誕生日ベースTRS下取り"];
+    const used = [];
+    ["active", "carryNext", "carryFuture"].forEach(k => (state.model[k] || []).forEach(x => { if (x.baseName && !base.includes(x.baseName) && !used.includes(x.baseName)) used.push(x.baseName); }));
+    return base.concat(used);
+  }
+  // 入力文字に関係なく「常に全候補」を出すコンボ（datalistの前方一致フィルタを回避）
+  function comboField(m, f, getOptions, attrs) {
+    const wrap = el("div", { class: "combo" });
+    const inp = el("input", { class: attrs.class, value: m[f] ?? "", placeholder: attrs.placeholder, "data-id": m.id, "data-field": f, autocomplete: "off" });
+    const menu = el("div", { class: "combo-menu" });
+    const open = () => {
+      menu.innerHTML = "";
+      const opts = getOptions(); if (!opts.length) return;
+      opts.forEach(o => {
+        const it = el("div", { class: "combo-opt" + (m[f] === o ? " sel" : "") }, o);
+        it.addEventListener("mousedown", e => { e.preventDefault(); inp.value = o; m[f] = o; inp.dispatchEvent(new Event("change", { bubbles: true })); menu.classList.remove("open"); if (f === "baseName") { refreshAllNames(); applyFamilyColors(); } });
+        menu.append(it);
+      });
+      const r = inp.getBoundingClientRect();
+      menu.style.left = r.left + "px"; menu.style.top = (r.bottom + 2) + "px"; menu.style.minWidth = r.width + "px";
+      menu.classList.add("open");
+    };
+    inp.addEventListener("focus", open);
+    inp.addEventListener("click", open);
+    inp.addEventListener("blur", () => setTimeout(() => menu.classList.remove("open"), 150));
+    wrap.append(inp, menu);
+    return wrap;
+  }
+  // 直前行の施策名（表示中の並び順で）。同名が連続するときは2行目以降を薄く表示するための判定に使う
+  function prevBaseIn(key, id) {
+    const rows = sortView(state.model[key].filter(passFilters));
+    const i = rows.findIndex(x => x.id === id);
+    return i > 0 ? (rows[i - 1].baseName || "").trim() : null;
+  }
+  // 中止済みの施策は一覧の最後尾へ寄せ、番号は振らない（通し番号は実施中の施策だけで数える）
+  function orderedRows(key) {
+    const rows = sortView(state.model[key].filter(passFilters));
+    const live = rows.filter(m => !m.cancelled);
+    const cancelled = rows.filter(m => m.cancelled);
+    return { live, cancelled, all: [...live, ...cancelled] };
+  }
+  // 表示中の並び順での通し番号（並べ替え後は上から1,2,3…に自動で振り直し。中止済みは番号なし）
+  function rowNo(key, m) {
+    if (m.cancelled) return "";
+    const { live } = orderedRows(key);
+    const i = live.findIndex(x => x.id === m.id);
+    return i >= 0 ? i + 1 : "";
+  }
+  // 中止になった施策から、この施策(m)へリストが振り替えられている分を集める（同月内の今月実施セクションのみが対象）
+  function incomingReallocations(m) {
+    return state.model.active.filter(x => x.cancelled && x.reallocateToId === m.id && (parseInt(x.reallocateCount, 10) || 0) > 0)
+      .map(x => ({ from: x, count: x.reallocateCount }));
+  }
+  function row(key, m) {
+    const tr = el("tr", { "data-row": m.id });
+    if (state.expanded[m.id]) tr.classList.add("expanded-row");
+    if (state.selected.has(m.id)) tr.classList.add("selected");
+    if (m.highlight) tr.classList.add("highlighted");
+    if (m.cancelled) tr.classList.add("cancelled-row");
+    const fc = familyColorOf(m);
+    if (fc) { tr.classList.add("fam-row"); tr.style.setProperty("--band", fc); }
+    if (prevBaseIn(key, m.id) === (m.baseName || "").trim() && (m.baseName || "").trim()) tr.classList.add("name-repeat");
+    const rno = rowNo(key, m);
+    if (rno % 2 === 0) tr.classList.add("stripe");   // 薄いシマシマ（施策行のみが対象。展開中の内訳行は数えない）
+    const td = (c, cls) => { const x = el("td", cls ? { class: cls } : {}); x.append(c); return x; };
+    // ドラッグは左端ハンドルのみ（セル内のテキスト選択・コピーを妨げない）
+    const sortActive = !!state.sort.field;
+    const handle = el("span", { class: "drag" + (sortActive ? " off" : ""), draggable: sortActive ? "false" : "true", title: sortActive ? "並び替え適用中は手動移動できません（『解除』後に可）" : "ドラッグで並べ替え（複数選択中はまとめて移動）" }, "⋮⋮");
+    handle.addEventListener("dragstart", e => {
+      if (!state.editing || sortActive) { e.preventDefault(); return; }
+      const fromSel = state.selected.has(m.id) && state.selected.size > 0;
+      const batch = fromSel ? [...state.selected] : [m.id];
+      state.dragBatch = batch; state.dragCanceled = false; state.dragFromSel = fromSel; state.dragMoved = false;
+      state.dragId = batch.length === 1 ? m.id : null;   // 単体のみ同一セクション内で並べ替え
+      state.dragKey = key; state.dragMeasure = { id: m.id, key }; state.draggingMeasure = true;
+      tr.classList.add("dragging"); $("#cfHot").classList.add("active");
+      e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", m.id);
+      try { e.dataTransfer.setDragImage(tr, 40, 16); } catch (_) {}
+    });
+    handle.addEventListener("dragend", () => {
+      tr.classList.remove("dragging");
+      const fromSel = state.dragFromSel; const openCF = cf.dragMode;
+      cleanupDrag(); if (openCF) closeCoverflow();
+      // 選択から始めたドラッグは、移動でもキャンセル（枠外／Escape）でも終了時に必ず選択を解除
+      if (fromSel) { state.selected.clear(); rerender(); }
+    });
+    // 展開トグル（裏側の施策概要/特典/RO版FIX）
+    const hasNote = !!((m.note && m.note.trim()) || (m.benefit && m.benefit.trim()) || (m.roFixDate && m.roFixDate.trim()) || (m.products && m.products.trim())
+      || (m.supplement && m.supplement.trim()) || (m.remark && m.remark.trim()) || (m.origCode1 && m.origCode1.trim()) || (m.origCode2 && m.origCode2.trim()) || (m.printerNote && m.printerNote.trim()) || m.cancelled);
+    const exp = el("button", { class: "expander" + (hasNote ? " hasnote" : "") + (state.expanded[m.id] ? " open" : ""), title: hasNote ? "詳細・メモあり（クリックで開閉）" : "詳細・メモを開く" });
+    exp.append(icon(state.expanded[m.id] ? "chevron-down" : "chevron-right"));
+    if (hasNote) exp.append(el("i", { class: "ti ti-note note-dot", "aria-hidden": "true" }));
+    // 複数選択中に1件の内訳を開閉したら、選択中の行すべてを同じ開閉状態にする
+    exp.addEventListener("click", () => {
+      const next = !state.expanded[m.id];
+      if (state.selected.size > 1 && state.selected.has(m.id)) state.selected.forEach(id => { state.expanded[id] = next; });
+      else state.expanded[m.id] = next;
+      rerender();
+    });
+    const dragCell = el("td", { class: "c-drag" });
+    // 選択チェックは編集/閲覧の両モードで表示（値の書き換えは引き続き編集モード限定）
+    const chk = el("input", { type: "checkbox", class: "rowsel", title: "選択（ドラッグでまとめてチェック→件数合計を表示）" });
+    chk.checked = state.selected.has(m.id);
+    const setChecked = (on) => { chk.checked = on; if (on) state.selected.add(m.id); else state.selected.delete(m.id); tr.classList.toggle("selected", on); updateSelBar(); };
+    chk.addEventListener("change", () => setChecked(chk.checked));
+    // 上から下へドラッグすると、通った行のチェックを連続でON/OFFできる（Excelのドラッグ選択と同じ操作感）。
+    // mousedownで即トグルするため、その直後に発生するclickのネイティブトグルで元に戻ってしまう（単純クリックが効かない）
+    // のを防ぐ：マウス操作で処理済みの場合だけclickのデフォルト動作を止める（キーボード操作のSpaceは素通りさせる）
+    let mouseHandled = false;
+    chk.addEventListener("mousedown", (e) => { e.preventDefault(); mouseHandled = true; state.dragCheckOn = !chk.checked; setChecked(state.dragCheckOn); document.body.classList.add("no-usersel"); });
+    chk.addEventListener("click", (e) => { if (mouseHandled) { e.preventDefault(); mouseHandled = false; } });
+    chk.addEventListener("mouseenter", () => { if (state.dragCheckOn != null) setChecked(state.dragCheckOn); });
+    dragCell.append(chk);
+    dragCell.append(handle, exp);
+    tr.append(el("td", { class: "c-no" }, String(rno)));
+    tr.append(dragCell);
+    const nameCell = el("td", {});
+    nameCell.append(comboField(m, "baseName", baseSuggestions, { class: "w-name", placeholder: "施策名" }));
+    if (m.cancelled) nameCell.append(el("span", { class: "cancel-badge", title: m.cancelReason || "" }, "中止"));
+    tr.append(nameCell);
+    tr.append(td(comboField(m, "owner", getOwners, { class: "w-own", placeholder: "担当" })));
+    tr.append(td(pick(m, "kind", M.kinds, { class: "w-kind" })));
+    tr.append(td(pick(m, "listMethod", M.listMethods, { class: "w-lm" })));
+    tr.append(td(deliveryField(m)));
+    if (state.showP3) {
+      tr.append(td(numField(m, "p3", true, "w-p3")));
+      tr.append(td(field(m, "priority", { class: "w-pri", type: "number", min: "1", placeholder: "—" })));
+    }
+    const cntCell = el("td", {});
+    cntCell.append(numField(m, "estimatedCount", false, "w-cnt"));
+    const inflow = incomingReallocations(m);
+    if (inflow.length) {
+      // 件数は振替先の想定件数にすでに合算済み。ここでは「その内訳」を示すだけ
+      const label = inflow.map(x => `${x.from.baseName || "(無題)"} +${(parseInt(x.count, 10) || 0).toLocaleString()}`).join("・");
+      cntCell.append(el("span", { class: "realloc-in", title: "中止になった施策から振り替えられた分（すでに合算済み）" },
+        icon("corner-left-up"), " " + label + " を含む"));
+    }
+    tr.append(cntCell);
+    if (state.showCode) { const codeCell = el("td", { class: "c-code", "data-code": m.id }); renderCodeCell(codeCell, m); tr.append(codeCell); }
+    // 正式名候補：編集可＋コピー
+    const der = el("td", { class: "c-derived", "data-derived": m.id });
+    const nin = el("input", { class: "namein", value: derive(m, state.month).fullName, title: "編集可。案件共有シートで確定後の正式名を貼り戻す用" });
+    nin.addEventListener("input", () => { m.officialName = nin.value; });
+    const cp = el("button", { class: "iconbtn copyname", title: "施策名（正式名）だけをコピー" }); cp.append(icon("clipboard-text"));
+    cp.addEventListener("click", () => { if (navigator.clipboard) navigator.clipboard.writeText(nin.value).then(() => flash("施策名をコピーしました")).catch(() => {}); });
+    der.append(nin, cp); tr.append(der);
+    // LP・テスト検証は既定で非表示（トグルで表示）
+    if (state.showLP) tr.append(td(lpToggle(m), "c-lp"));
+    if (state.showTest) { const cmpCell = el("td", { class: "c-cmp", "data-cmp": m.id }); renderCmpCell(cmpCell, m); tr.append(cmpCell); }
+    const hlBtn = el("button", { class: "iconbtn hl-btn" + (m.highlight ? " on" : ""), title: m.highlight ? "重要マークを外す" : "重要な施策としてハイライト" });
+    hlBtn.append(icon("highlight"));
+    hlBtn.addEventListener("click", () => {
+      if (!state.editing) return;
+      const next = !m.highlight;
+      const n = applyToSelection(m, "highlight", next);
+      markDirty(); rerender();
+      if (n > 1) flash(`選択中の${n}件をまとめて変更しました`);
+    });
+    const moveBtn = el("button", { class: "iconbtn", title: "別のセクションへ移動" }); moveBtn.append(icon("arrows-move"));
+    moveBtn.addEventListener("click", e => { e.stopPropagation(); openMoveMenu(key, m.id, moveBtn); });
+    tr.append(td(el("div", { class: "ops" }, hlBtn, moveBtn,
+      el("button", { class: "iconbtn", title: "この施策を1行まるごと複製", onclick: () => copyMeasure(key, m.id) }, icon("row-insert-bottom")),
+      el("button", { class: "iconbtn danger", title: "この施策を削除", onclick: () => del(key, m.id) }, icon("trash"))), "c-ops"));
+    // ドラッグ中：どちら側に入るかを線で表示（行の上半分＝上に挿入／下半分＝下に挿入）
+    tr.addEventListener("dragover", e => {
+      if (!state.draggingMeasure) return;
+      e.preventDefault();
+      const rect = tr.getBoundingClientRect();
+      const after = (e.clientY - rect.top) > rect.height / 2;
+      if (state.dropOverId !== m.id || state.dropAfter !== after) {
+        clearDropMarks();
+        state.dropOverId = m.id; state.dropAfter = after;
+        tr.classList.add(after ? "drop-below" : "drop-above");
+      }
+    });
+    tr.addEventListener("drop", e => {
+      e.preventDefault(); e.stopPropagation();
+      const rows = sortView(state.model[key].filter(passFilters));
+      const i = rows.findIndex(x => x.id === m.id);
+      const targetId = state.dropAfter ? (rows[i + 1] ? rows[i + 1].id : null) : m.id;
+      clearDropMarks();
+      handleRowDrop(key, targetId);
+    });
+    return tr;
+  }
+  function clearDropMarks() {
+    document.querySelectorAll("tr.drop-above, tr.drop-below").forEach(x => x.classList.remove("drop-above", "drop-below"));
+    state.dropOverId = null; state.dropAfter = false;
+  }
+  function renderCodeCell(cell, m) {
+    cell.innerHTML = "";
+    const confirmed = m.codeStatus === "確定";
+    const prefix = window.prefixOfCategory(m.category);
+    const has = m.num !== "" && m.num != null;
+    cell.className = "c-code " + (confirmed ? "code-ok" : "code-pend");
+    // カテゴリと番号を分けず、「DME66」のように1本の欄でそのまま入力・貼り付けできるようにする
+    const parseCode = (row, raw) => {
+      const v = String(raw).split("\t")[0].trim();
+      const mm = v.match(/^([A-Za-z]+)\s*0*([0-9]*)\s*$/);
+      if (mm && mm[1] && M.categories.some(c => c.key === mm[1].toUpperCase())) {
+        row.category = mm[1].toUpperCase();
+        if (mm[2] !== "") row.num = mm[2];
+      } else {
+        row.num = v.replace(/[^0-9]/g, "");
+      }
+    };
+    const codeInp = el("input", { class: "w-code", value: has ? window.buildMaterialShort(m.category, m.num) : (m.category || ""), placeholder: "例：DMB180" , title: "素材コードをそのまま入力・貼り付け（例：DMB180）。カテゴリと番号は自動で分けます" });
+    codeInp.addEventListener("change", () => { if (!state.editing) return; parseCode(m, codeInp.value); markDirty(); rerenderRow(sectionOf(m), m); renderSummary(); });
+    // Excelで複数セル（例：DME66〜DME70）をコピー→この欄に貼り付けで、下の行へ一気に入れる
+    attachFillDownPaste(codeInp, m, parseCode);
+    cell.append(codeInp);
+    cell.append(el("span", { class: "codeval " + (confirmed ? "ok" : "pend") }, has ? window.buildMaterialCode(prefix, m.num) : "—"));
+    const on = confirmed;
+    const tog = el("button", { class: "ministat " + (on ? "ok" : "pend"), title: "素材コード：" + (on ? "確定" : "未確定") + "（クリックで切替）" });
+    tog.append(icon(on ? "circle-check" : "circle-dashed"));
+    tog.addEventListener("click", () => {
+      if (!state.editing) return;
+      const n = applyToSelection(m, "codeStatus", on ? "未確定" : "確定");
+      markDirty(); rerender();
+      if (n > 1) flash(`選択中の${n}件をまとめて変更しました`);
+    });
+    cell.append(tog);
+  }
+  // テスト検証：RO等は「—」、テストは必ず OK / NG
+  function renderCmpCell(cell, m) {
+    cell.innerHTML = "";
+    if (m.kind !== "テスト") { cell.append(el("span", { class: "muted-dash" }, "—")); return; }
+    const on = !!m.testValidated;
+    const b = el("button", { class: "valid-btn " + (on ? "ok" : "ng"), title: on ? "テスト検証OK（クリックで解除）" : "未検証（チーム確認後クリックでOKに）" });
+    b.textContent = on ? "OK" : "NG";
+    b.addEventListener("click", () => {
+      if (!state.editing) return;
+      const n = applyToSelection(m, "testValidated", !on);
+      markDirty(); rerender();
+      if (n > 1) flash(`選択中の${n}件をまとめて変更しました`);
+    });
+    cell.append(b);
+  }
+  // LP作成の要否：○＝作る／×＝作らない（クリックで切替。素材コードのOKマークと同じ見た目）
+  function lpToggle(m) {
+    const on = m.lp === "○";
+    const b = el("button", { class: "ministat " + (on ? "ok" : "pend"), title: "LP作成：" + (on ? "作る（○）" : "作らない（×）") + "（クリックで切替）" });
+    b.append(icon(on ? "circle-check" : "circle-dashed"));
+    b.addEventListener("click", () => {
+      if (!state.editing) return;
+      const n = applyToSelection(m, "lp", on ? "×" : "○");
+      markDirty(); rerender();
+      if (n > 1) flash(`選択中の${n}件をまとめて変更しました`);
+    });
+    return b;
+  }
+  function statusChip(m, f, key, label) {
+    const on = m[f] === "確定";
+    const b = el("button", { class: "status " + (on ? "ok" : "pend"), title: label + "：" + (on ? "確定" : "未確定") + "（クリックで切替）" });
+    b.append(icon(on ? "circle-check" : "circle-dashed"));
+    b.addEventListener("click", () => { if (!state.editing) return; m[f] = on ? "未確定" : "確定"; rerenderRow(key, m); renderSummary(); });
+    return b;
+  }
+  // 全行の正式名(候補)を再計算（RO①②の採番は兄弟行に依存）。手動編集(officialName)済みは触らない
+  function refreshAllNames() {
+    document.querySelectorAll("[data-derived]").forEach(cell => {
+      const id = cell.getAttribute("data-derived"); const m = findMeasure(id); if (!m) return;
+      const nin = cell.querySelector(".namein");
+      if (nin && !(m.officialName && m.officialName.trim())) nin.value = derive(m, state.month).fullName;
+    });
+  }
+  // 行を作り直す時、いま入力している欄（直前にクリックして入ったばかりの欄も含む）が消えないよう、
+  // フォーカスとカーソル位置を新しい行の同じ欄へ引き継ぐ
+  function replaceRowKeepFocus(tr, newTr) {
+    const a = document.activeElement;
+    const sel = "input, select, textarea";
+    let idx = -1, selStart = null, selEnd = null;
+    if (a && tr.contains(a)) {
+      idx = [...tr.querySelectorAll(sel)].indexOf(a);
+      try { selStart = a.selectionStart; selEnd = a.selectionEnd; } catch (_) {}
+    }
+    tr.replaceWith(newTr);
+    if (idx < 0) return;
+    const t = [...newTr.querySelectorAll(sel)][idx]; if (!t) return;
+    t.focus();
+    if (selStart != null) { try { t.setSelectionRange(selStart, selEnd); } catch (_) {} }
+  }
+  // 入力欄のblurから呼ぶ用。クリック先へフォーカスが移りきってから作り直す（先に作り直すと移動先が消える）
+  function rerenderRowSoon(key, m) { setTimeout(() => rerenderRow(key, m), 0); }
+  function rerenderRow(key, m) {
+    markDirty();
+    const tr = document.querySelector(`tr[data-row="${m.id}"]`); if (tr) replaceRowKeepFocus(tr, row(key, m));
+    // この施策を比較元にしている行も更新
+    ["active","carryNext","carryFuture"].forEach(k => state.model[k].forEach(mm => {
+      if (mm.compareBaseId === m.id) { const t = document.querySelector(`tr[data-row="${mm.id}"]`); if (t) replaceRowKeepFocus(t, row(k, mm)); }
+    }));
+  }
+  function copyMeasure(key, id) {
+    if (!state.editing) return;
+    const l = state.model[key]; const i = l.findIndex(x => x.id === id); if (i < 0) return;
+    const c = JSON.parse(JSON.stringify(l[i]));
+    c.id = uid(); c.num = ""; c.codeStatus = "未確定"; c.officialName = ""; c.compareBaseId = id; // 複製は元施策を比較元に
+    l.splice(i + 1, 0, c); markDirty(); rerender(); flash("直下に複製しました（比較元＝元の施策）");
+  }
+  function reorder(key, dragId, targetId) {
+    const l = state.model[key]; const from = l.findIndex(x => x.id === dragId); if (from < 0) return;
+    const [it] = l.splice(from, 1); let to = l.findIndex(x => x.id === targetId);
+    if (to < 0) l.push(it); else l.splice(to, 0, it);
+    rerender();
+  }
+  // ドラッグ状態のクリア
+  function cleanupDrag() { state.dragBatch = null; state.dragId = null; state.dragKey = null; state.dragMeasure = null; state.draggingMeasure = false; state.dragCanceled = false; state.dragFromSel = false; state.dragMoved = false; $("#cfHot").classList.remove("active"); clearDropMarks(); }
+  function clearSel() { state.selected.clear(); updateSelBar(); rerender(); }
+  function setSelExpanded(on) { state.selected.forEach(id => { state.expanded[id] = on; }); rerender(); }
+  // 行/セクションへのドロップ処理（単体＝並べ替え、複数＝まとめて移動。別セクションへも可）
+  function handleRowDrop(toKey, targetId) {
+    if (!state.editing || state.dragCanceled) return; // 後片付けは dragend で行う
+    const batch = state.dragBatch; if (!batch || !batch.length) return;
+    if (batch.length === 1 && batch[0] === targetId) return; // 自分自身へは何もしない
+    moveBatch(batch, toKey, targetId); state.dragMoved = true;
+    if (batch.length > 1) flash(`${batch.length}件を「${SEC_LABEL[toKey]}」へ移動しました`);
+    rerender();
+  }
+  // 複数施策を toKey セクションへ（beforeId の前に）移動。別セクションをまたいでも順序を保つ
+  function moveBatch(ids, toKey, beforeId) {
+    markDirty();
+    const idset = new Set(ids);
+    const picked = [];
+    ["active", "carryNext", "carryFuture"].forEach(k => {
+      state.model[k] = state.model[k].filter(m => { if (idset.has(m.id)) { picked.push(m); return false; } return true; });
+    });
+    if (!picked.length) return;
+    const target = state.model[toKey];
+    let idx = target.length;
+    if (beforeId && !idset.has(beforeId)) { const bi = target.findIndex(m => m.id === beforeId); if (bi >= 0) idx = bi; }
+    target.splice(idx, 0, ...picked);
+  }
+  // 選択操作バー（複数選択時に下部に表示）
+  function updateSelBar() {
+    let bar = $("#selBar");
+    if (!bar) { bar = el("div", { id: "selBar", class: "sel-bar" }); document.body.append(bar); }
+    const n = state.selected.size;
+    if (n === 0) { bar.classList.remove("show"); bar.innerHTML = ""; return; }
+    bar.innerHTML = "";
+    let sum = 0;
+    ["active", "carryNext", "carryFuture"].forEach(k => state.model[k].forEach(m => { if (state.selected.has(m.id)) sum += parseInt(m.estimatedCount, 10) || 0; }));
+    bar.append(el("span", { class: "sel-sum" }, `${n}件・${sum.toLocaleString()}件`));
+    if (n > 1) {
+      bar.append(el("button", { class: "btn small ghost onwhite", onclick: () => setSelExpanded(true) }, "▼ まとめて開く"));
+      bar.append(el("button", { class: "btn small ghost onwhite", onclick: () => setSelExpanded(false) }, "▲ まとめて閉じる"));
+    }
+    bar.append(el("button", { class: "btn small ghost onwhite", onclick: clearSel }, "選択解除"));
+    bar.classList.add("show");
+  }
+  // 過去月比較の選択操作バー（キーは"month:id"の複合キー）
+  function updateCrossSelBar() {
+    let bar = $("#crossSelBar");
+    if (!bar) { bar = el("div", { id: "crossSelBar", class: "sel-bar" }); document.body.append(bar); }
+    const n = state.crossSelected.size;
+    if (n === 0) { bar.classList.remove("show"); bar.innerHTML = ""; return; }
+    bar.innerHTML = "";
+    bar.append(el("span", { class: "sel-sum" }, `過去月：${n}件選択中`));
+    bar.append(el("button", { class: "btn small ghost onwhite", onclick: () => setCrossSelExpanded(true) }, "▼ まとめて開く"));
+    bar.append(el("button", { class: "btn small ghost onwhite", onclick: () => setCrossSelExpanded(false) }, "▲ まとめて閉じる"));
+    bar.append(el("button", { class: "btn small ghost onwhite", onclick: clearCrossSel }, "選択解除"));
+    bar.classList.add("show");
+  }
+  function setCrossSelExpanded(on) { state.crossSelected.forEach(key => { state.crossExpanded[key] = on; }); renderBody(); }
+  function clearCrossSel() { state.crossSelected.clear(); renderBody(); }
+  // 複数施策を別の月へ移動（コピー元＝現在の月）
+  async function moveBatchToMonth(ids, targetMonth) {
+    if (!state.editing || !targetMonth) return;
+    if (targetMonth === state.month) { flash("同じ月です"); return; }
+    const idset = new Set(ids);
+    const picked = [];
+    ["active", "carryNext", "carryFuture"].forEach(k => state.model[k].forEach(m => { if (idset.has(m.id)) picked.push(m); }));
+    if (!picked.length) return;
+    const clones = picked.map(src => { const c = JSON.parse(JSON.stringify(src)); c.id = uid(); c.codeStatus = "未確定"; c.num = ""; c.officialName = ""; c.testValidated = false; c.compareBaseId = ""; return c; });
+    const raw = await S.readMonth(targetMonth);
+    const tgt = normalize(raw ? JSON.parse(JSON.stringify(raw)) : emptyModel(targetMonth));
+    tgt.active.push(...clones); tgt.updatedAt = new Date().toISOString(); tgt.updatedBy = state.user;
+    await S.writeMonth(targetMonth, tgt);
+    ["active", "carryNext", "carryFuture"].forEach(k => state.model[k] = state.model[k].filter(m => !idset.has(m.id)));
+    ids.forEach(id => state.selected.delete(id));
+    state.model.updatedAt = new Date().toISOString(); state.model.updatedBy = state.user;
+    await S.writeMonth(state.month, state.model); state.mtime = await S.monthMtime(state.month);
+    rerender();
+    flash(`${window.monthLabel(targetMonth)} へ ${picked.length}件 移動しました`);
+  }
+  const SEC_LABEL = { active: "今月実施", carryNext: "アイデア欄", carryFuture: "今後へ持越し" };
+  function moveMeasure(fromKey, id, toKey) {
+    if (!state.editing) return;
+    const l = state.model[fromKey]; const i = l.findIndex(x => x.id === id); if (i < 0) return;
+    const [it] = l.splice(i, 1); state.model[toKey].push(it); markDirty(); rerender(); flash(`「${SEC_LABEL[toKey]}」へ移動しました`);
+  }
+  function openMoveMenu(key, id, anchor) {
+    closeColMenu();
+    const menu = el("div", { id: "colMenu", class: "col-menu" });
+    menu.addEventListener("click", e => e.stopPropagation());   // メニュー内クリックで閉じない
+    menu.append(el("div", { class: "cm-sep" }, "このシート内で移動"));
+    [["active","今月実施"],["carryNext","アイデア欄"]].filter(([k]) => k !== key)
+      .forEach(([k, lab]) => menu.append(el("button", { class: "cm-item", onclick: () => { moveMeasure(key, id, k); closeColMenu(); } }, "→ " + lab)));
+    // 別の月へ（既存の月のみ）
+    S.listMonths().then(months => {
+      const others = months.filter(mo => mo !== state.month);
+      if (!others.length) return;
+      menu.append(el("div", { class: "cm-sep" }, "別の月へ（素材コードは未確定に）"));
+      const sel = el("select", { class: "cm-monthsel" });
+      others.forEach(mo => sel.append(el("option", { value: mo }, window.monthLabel(mo))));
+      menu.append(sel);
+      menu.append(el("div", { class: "cm-btnrow" },
+        el("button", { class: "cm-mini", onclick: () => { copyMoveToMonth(key, id, sel.value, "copy"); closeColMenu(); } }, icon("copy"), " コピー"),
+        el("button", { class: "cm-mini", onclick: () => { copyMoveToMonth(key, id, sel.value, "move"); closeColMenu(); } }, icon("arrow-right"), " 移動")));
+    });
+    const r = anchor.getBoundingClientRect();
+    menu.style.left = Math.min(r.left, window.innerWidth - 220) + "px"; menu.style.top = (r.bottom + 2) + "px";
+    document.body.append(menu); setTimeout(() => document.addEventListener("click", closeColMenu), 0);
+  }
+  async function copyMoveToMonth(fromKey, id, targetMonth, mode) {
+    if (!state.editing || !targetMonth) return;
+    const l = state.model[fromKey]; const i = l.findIndex(x => x.id === id); if (i < 0) return;
+    const c = JSON.parse(JSON.stringify(l[i]));
+    c.id = uid(); c.codeStatus = "未確定"; c.num = ""; c.officialName = ""; c.testValidated = false; c.compareBaseId = "";
+    const raw = await S.readMonth(targetMonth);
+    const tgt = normalize(raw ? JSON.parse(JSON.stringify(raw)) : emptyModel(targetMonth));
+    tgt.active.push(c); tgt.updatedAt = new Date().toISOString(); tgt.updatedBy = state.user;
+    await S.writeMonth(targetMonth, tgt);
+    if (mode === "move") {
+      l.splice(i, 1);
+      state.model.updatedAt = new Date().toISOString(); state.model.updatedBy = state.user;
+      await S.writeMonth(state.month, state.model); state.mtime = await S.monthMtime(state.month);
+      rerender();
+    }
+    flash(`${window.monthLabel(targetMonth)} へ${mode === "move" ? "移動" : "コピー"}しました`);
+  }
+
+  // ============ Cover Flow（月めくり＋別月へドロップ） ============
+  async function cfLoad() {
+    const months = (await S.listMonths()).slice().reverse();   // 古い→新しい（左→右）
+    const data = [];
+    for (const mo of months) { const m = await S.readMonth(mo); const cnt = m ? (m.active || []).filter(x => x.baseName).length : 0; data.push({ month: mo, count: cnt }); }
+    cf.data = data;
+  }
+  async function openCoverflow(dragMode) {
+    const ov = $("#coverflow");
+    if (cf.opening || ov.classList.contains("open")) return;   // 二重オープン防止（ドラッグ中のカクつき対策）
+    cf.opening = true;
+    await cfLoad();
+    if (!cf.data.length) { cf.opening = false; flash("保存済みの月がありません。まず保存してください。"); return; }
+    cf.dragMode = !!dragMode;
+    const idx = cf.data.findIndex(d => d.month === state.month);
+    cf.sel = idx >= 0 ? idx : cf.data.length - 1;
+    renderCF();
+    ov.classList.add("open"); ov.classList.toggle("dragmode", !!dragMode); ov.setAttribute("aria-hidden", "false");
+    const hint = $("#cfDropHint");
+    if (hint) { hint.style.display = dragMode ? "block" : "none"; hint.textContent = "月のカードにドロップで、その月へ移動します（枠の外に出すと、やめます）"; }
+    cf.opening = false;
+    if (!dragMode) setTimeout(() => $("#cfStage").focus(), 0);
+  }
+  function closeCoverflow() { const ov = $("#coverflow"); if (ov) { ov.classList.remove("open", "dragmode"); ov.setAttribute("aria-hidden", "true"); } cf.opening = false; }
+  function renderCF() {
+    const stage = $("#cfStage"), dotsEl = $("#cfDots"); stage.innerHTML = ""; dotsEl.innerHTML = "";
+    cf.cards = cf.data.map((d, i) => {
+      const c = el("div", { class: "cf-card" + (d.month === state.month ? " here" : ""), "data-month": d.month });
+      c.append(el("div", { class: "cf-top" }));
+      c.append(el("div", { class: "cf-yr" }, d.month.slice(0, 4) + "年"));
+      c.append(el("div", { class: "cf-mo" }, parseInt(d.month.slice(4), 10) + "月"));
+      c.append(el("div", { class: "cf-st" }, "施策数 ", el("b", {}, String(d.count))));
+      const open = el("button", { class: "cf-open", onclick: e => { e.stopPropagation(); if (d.month !== state.month) window.open(monthWindowUrl(d.month), "_blank", "noopener,width=1400,height=900"); } }, d.month === state.month ? "表示中" : "この月を開く ↗");
+      c.append(open);
+      c.addEventListener("click", () => { if (i !== cf.sel) { cf.sel = i; positionCF(); } });
+      c.addEventListener("dragover", e => { if (state.draggingMeasure) { e.preventDefault(); if (cf.sel !== i) { cf.sel = i; positionCF(); } } });
+      c.addEventListener("drop", e => { e.preventDefault(); if (state.dragBatch) dropMeasureToMonth(d.month); });
+      stage.append(c); return c;
+    });
+    cf.dots = cf.data.map((d, i) => { const dot = el("div", { class: "cf-dot", onclick: () => { cf.sel = i; positionCF(); } }); dotsEl.append(dot); return dot; });
+    positionCF();
+  }
+  function positionCF() {
+    cf.data.forEach((d, i) => {
+      const off = i - cf.sel, abs = Math.abs(off);
+      const x = off * 100, ry = Math.max(-55, Math.min(55, off * -42)), tz = -abs * 150, sc = off === 0 ? 1 : .85;
+      const c = cf.cards[i];
+      c.style.transform = `translateX(${x}px) translateZ(${tz}px) rotateY(${ry}deg) scale(${sc})`;
+      c.style.zIndex = String(100 - abs); c.style.opacity = abs > 3 ? "0" : "1";
+      c.classList.toggle("sel", off === 0);
+      if (cf.dots[i]) cf.dots[i].classList.toggle("on", off === 0);
+    });
+    const d = cf.data[cf.sel];
+    $("#cfCur").textContent = d ? `${d.month.slice(0,4)}年 ${parseInt(d.month.slice(4),10)}月 ${cf.dragMode ? "（ここにドロップで移動）" : (d.month===state.month?"（表示中）":"")}` : "";
+  }
+  async function selectMonthFromCF(month) { closeCoverflow(); if (month === state.month) return; await renderMonthSelect(); $("#monthSelect").value = month; await loadMonth(month); }
+  // 別ウィンドウで月を開くときのURL：今かけているフィルター（施策名・担当など）を引き継ぐ
+  function monthWindowUrl(month) {
+    const params = new URLSearchParams();
+    params.set("month", month);
+    const activeFilters = {};
+    Object.keys(state.filters || {}).forEach(k => { if (state.filters[k] != null) activeFilters[k] = state.filters[k]; });
+    if (Object.keys(activeFilters).length) params.set("filters", JSON.stringify(activeFilters));
+    return location.pathname + "?" + params.toString();
+  }
+  async function dropMeasureToMonth(targetMonth) {
+    const canceled = state.dragCanceled;
+    const batch = state.dragBatch ? [...state.dragBatch] : [];
+    closeCoverflow();                                   // 後片付けは dragend、ここでは移動のみ実行
+    if (!canceled && batch.length) { state.dragMoved = true; await moveBatchToMonth(batch, targetMonth); }
+  }
+  // 行の下に開く詳細（施策の裏側データ：施策概要・特典・RO版FIX）
+  function detailRow(key, m) {
+    const tr = el("tr", { class: "detail-row" });
+    const cell = el("td", { colspan: String(activeCols().length) });
+    // 親と同系の色（赤/青/緑系）の薄い背景＋色帯を引き継ぐ
+    const fc = familyColorOf(m);
+    if (fc) { cell.style.boxShadow = "inset 6px 0 0 " + fc; cell.style.borderBottom = "2px solid " + fc; cell.style.background = lightenHex(fc, 0.85); }
+    const box = el("div", { class: "detail" });
+    const grid = el("div", { class: "detail-grid" });
+    // リスト条件（メモ）：普段1行、入力に応じて自動で伸びる
+    const wNote = el("div", { class: "dw-field col-note" });
+    wNote.append(el("div", { class: "dw-lab" }, "リスト条件"));
+    const ta = el("textarea", { class: "d-note", rows: "1", placeholder: "" }); ta.value = m.note || "";
+    const grow = () => { ta.style.height = "auto"; ta.style.height = Math.max(30, ta.scrollHeight) + "px"; };
+    ta.addEventListener("input", () => { m.note = ta.value; grow(); });
+    ta.addEventListener("blur", () => rerenderRowSoon(key, m));
+    wNote.append(ta); setTimeout(grow, 0);
+    const mk = (label, f, cls, opts = {}) => {
+      const w = el("div", { class: "dw-field " + cls });
+      w.append(el("div", { class: "dw-lab" }, label));
+      const i = el("input", { value: m[f] || "", placeholder: opts.placeholder || "" });
+      i.addEventListener("input", () => { m[f] = i.value; });
+      i.addEventListener("blur", () => {
+        if (opts.dateFmt) { m[f] = normalizeDateSlashes(m[f]); i.value = m[f]; }
+        rerenderRowSoon(key, m);
+      });
+      if (opts.paste) attachFillDownPaste(i, m, (row, raw) => { row[f] = String(raw).split("\t")[0].trim(); });
+      w.append(i);
+      return w;
+    };
+    // 改行可能なテキスト欄（普段1行、入力に応じて自動で伸びる）
+    const mkArea = (label, f, cls) => {
+      const w = el("div", { class: "dw-field " + cls });
+      w.append(el("div", { class: "dw-lab" }, label));
+      const ta2 = el("textarea", { class: "d-note", rows: "1", placeholder: "" }); ta2.value = m[f] || "";
+      const grow2 = () => { ta2.style.height = "auto"; ta2.style.height = Math.max(30, ta2.scrollHeight) + "px"; };
+      ta2.addEventListener("input", () => { m[f] = ta2.value; grow2(); });
+      ta2.addEventListener("blur", () => rerenderRowSoon(key, m));
+      w.append(ta2); setTimeout(grow2, 0);
+      return w;
+    };
+    // 元素材コード①②：上下2行（DMB190くらいの文字数が入る幅）
+    const mkOrigCodes = () => {
+      const w = el("div", { class: "dw-field col-origcode" });
+      w.append(el("div", { class: "dw-lab" }, "元素材コード"));
+      const pair = el("div", { class: "origcode-pair" });
+      [["origCode1", "①"], ["origCode2", "②"]].forEach(([f, ph]) => {
+        const i = el("input", { class: "origcode-in", value: m[f] || "", placeholder: ph });
+        i.addEventListener("input", () => { m[f] = i.value; });
+        i.addEventListener("blur", () => rerenderRowSoon(key, m));
+        pair.append(i);
+      });
+      w.append(pair);
+      return w;
+    };
+    // 仕様（見積もり依頼のE列に対応。印刷会社の仕様区分）
+    const wSpec = el("div", { class: "dw-field col-spec" });
+    wSpec.append(el("div", { class: "dw-lab" }, "仕様"));
+    const specSel = el("select", {});
+    ["Z圧着", "A6はがき"].forEach(v => { const op = el("option", { value: v }, v); if ((m.spec || "Z圧着") === v) op.selected = true; specSel.append(op); });
+    specSel.addEventListener("change", () => { m.spec = specSel.value; rerenderRow(key, m); });
+    wSpec.append(specSel);
+    // 補足_特別対応（見積もり依頼のH列に対応。印刷会社への申し送り事項）
+    const wPrinterNote = el("div", { class: "dw-field col-printernote" });
+    wPrinterNote.append(el("div", { class: "dw-lab" }, "補足_特別対応（印刷会社申し送り）"));
+    const pnTa = el("textarea", { class: "d-note", rows: "1", placeholder: "" }); pnTa.value = m.printerNote || "";
+    const pnGrow = () => { pnTa.style.height = "auto"; pnTa.style.height = Math.max(30, pnTa.scrollHeight) + "px"; };
+    pnTa.addEventListener("input", () => { m.printerNote = pnTa.value; pnGrow(); });
+    pnTa.addEventListener("blur", () => rerenderRowSoon(key, m));
+    wPrinterNote.append(pnTa); setTimeout(pnGrow, 0);
+    // 掲載商品・特典、FIX時期・仕様はそれぞれ1列に上下2段でまとめる
+    const wProdBenefit = el("div", { class: "dw-stack col-prodbenefit" });
+    wProdBenefit.append(mk("掲載商品", "products", "col-prod"), mk("特典", "benefit", "col-benefit"));
+    const wFixSpec = el("div", { class: "dw-stack col-fixspec" });
+    wFixSpec.append(mk("FIX時期", "roFixDate", "col-fix", { placeholder: "yyyy/mm/dd", paste: true, dateFmt: true }), wSpec);
+    // 並び：リスト条件 → 施策概要 → 元素材コード①② → 補足 → 補足_特別対応 → 掲載商品・特典 → FIX時期・仕様
+    grid.append(wNote, mkArea("施策概要", "supplement", "col-supp"), mkOrigCodes(), mkArea("補足", "remark", "col-remark"), wPrinterNote, wProdBenefit, wFixSpec);
+    box.append(grid);
+    box.append(cancelSection(key, m));
+    cell.append(box); tr.append(cell); return tr;
+  }
+  // 振替先の想定件数へ差分(delta)を加算/減算する（負の値で取り消し）。0未満にはしない
+  function creditReallocation(destId, delta) {
+    if (!destId || !delta) return;
+    const dest = findMeasure(destId);
+    if (dest) dest.estimatedCount = String(Math.max(0, (parseInt(dest.estimatedCount, 10) || 0) + delta));
+  }
+  // 施策の中止・リスト振替（成績不振等で中止し、確保していたリストを同月の別施策へ振り替える運用の記録）
+  // 中止にした瞬間に件数は0になり、元の件数はそのまま振替先へ移す（部分的な移動は想定しないため、件数入力は無し＝振替先を選ぶだけ）
+  function cancelSection(key, m) {
+    const wrap = el("div", { class: "cancel-section" + (m.cancelled ? " on" : "") });
+    const head = el("div", { class: "cancel-head" });
+    const toggleBtn = el("button", { class: "cancel-toggle" + (m.cancelled ? " on" : "") },
+      icon(m.cancelled ? "toggle-right" : "toggle-left"), m.cancelled ? " 中止済み" : " この施策を中止する");
+    toggleBtn.addEventListener("click", () => {
+      if (!state.editing) { blockEdit(); return; }
+      if (!m.cancelled) {
+        m.cancelled = true;
+        if (!m.cancelDate) m.cancelDate = todayISO();
+        m.reallocateCount = String(parseInt(m.estimatedCount, 10) || 0);
+        m.estimatedCount = "0";
+      } else {
+        creditReallocation(m.reallocateToId, -(parseInt(m.reallocateCount, 10) || 0));
+        m.estimatedCount = m.reallocateCount || m.estimatedCount;
+        m.cancelled = false; m.reallocateToId = ""; m.reallocateCount = "";
+      }
+      markDirty(); rerender();
+    });
+    head.append(toggleBtn);
+    wrap.append(head);
+    if (!m.cancelled) return wrap;
+    const grid2 = el("div", { class: "cancel-grid" });
+    // 中止日
+    const wDate = el("div", { class: "dw-field col-canceldate" });
+    wDate.append(el("div", { class: "dw-lab" }, "中止日"));
+    const dateInp = el("input", { type: "date", value: m.cancelDate || "" });
+    dateInp.addEventListener("change", () => { if (!state.editing) { dateInp.value = m.cancelDate || ""; blockEdit(); return; } m.cancelDate = dateInp.value; markDirty(); });
+    wDate.append(dateInp);
+    // 中止理由（自由記述）
+    const wReason = el("div", { class: "dw-field col-cancelreason" });
+    wReason.append(el("div", { class: "dw-lab" }, "中止理由"));
+    const reasonTa = el("textarea", { class: "d-note", rows: "1", placeholder: "例：成績不振（開封率が目標の半分以下）のため中止" });
+    reasonTa.value = m.cancelReason || "";
+    const reasonGrow = () => { reasonTa.style.height = "auto"; reasonTa.style.height = Math.max(30, reasonTa.scrollHeight) + "px"; };
+    reasonTa.addEventListener("input", () => { m.cancelReason = reasonTa.value; reasonGrow(); });
+    reasonTa.addEventListener("blur", () => rerenderRowSoon(key, m));
+    wReason.append(reasonTa); setTimeout(reasonGrow, 0);
+    // 振替先（同月・今月実施の他施策から1つ選ぶ。選ぶだけで、確保していた件数がそのまま丸ごと移る）
+    const wDest = el("div", { class: "dw-field col-cancelto" });
+    wDest.append(el("div", { class: "dw-lab" }, "振替先（同月の施策）"));
+    const destSel = el("select", {});
+    destSel.append(el("option", { value: "" }, "選択してください"));
+    state.model.active.filter(x => x.id !== m.id && (x.baseName || "").trim()).forEach(x => {
+      const label = `${x.baseName}（${x.kind}${x.num ? " " + x.num : ""}）`;
+      const op = el("option", { value: x.id }, label);
+      if (m.reallocateToId === x.id) op.selected = true;
+      destSel.append(op);
+    });
+    destSel.addEventListener("change", () => {
+      if (!state.editing) { destSel.value = m.reallocateToId || ""; blockEdit(); return; }
+      const amt = parseInt(m.reallocateCount, 10) || 0;
+      creditReallocation(m.reallocateToId, -amt);
+      m.reallocateToId = destSel.value;
+      creditReallocation(m.reallocateToId, amt);
+      markDirty(); rerender();
+    });
+    wDest.append(destSel);
+    grid2.append(wDate, wReason, wDest);
+    wrap.append(grid2);
+    const dest = m.reallocateToId ? findMeasure(m.reallocateToId) : null;
+    if (dest) {
+      wrap.append(el("div", { class: "cancel-flow" },
+        el("span", { class: "cancel-chip from" }, `${m.baseName || "(無題)"}（中止・${(parseInt(m.reallocateCount, 10) || 0).toLocaleString()}件）`),
+        icon("arrow-right"),
+        el("span", { class: "cancel-chip to" }, `${dest.baseName || "(無題)"} に合算済み`)));
+    }
+    return wrap;
+  }
+
+  // ===== 施策名ごとの色分け（赤=お誕生日系 / 青=TRS系 / 緑=RAH系。主要は固定・派生は少しずらす） =====
+  // No.横の色帯だけに使う（行の背景タイルは廃止＝モノトーン運用）
+  let familyColors = {};
+  const FAMPAL = {
+    red:   ["#d1272d", "#c81f61", "#c94f18", "#a8203a", "#c85a29"],
+    blue:  ["#1c5fc2", "#0c7aa8", "#3446c4", "#295d9c", "#196fb0"],
+    green: ["#1c8235", "#4c7a12", "#0a8562", "#367c17", "#248442"],
+    other: ["#5642d6", "#a86c0c", "#5f6b78", "#7141c4"],
+  };
+  // お誕生日RAHは名前に"RAH"を含むため本来はキーワード優先でgreenになるが、
+  // お誕生日DM系列として扱いたいとの要望のためredに固定
+  const FIXED = { "お誕生日":["red",0], "TRS下取":["blue",0], "TRS下取り":["blue",0], "RAH買い替え":["green",0], "RAH買替":["green",0], "お誕生日RAH":["red",1] };
+  // キーワード優先：TRS→青、RAH→緑、（TRS/RAHが無く）お誕生日/誕生→赤、それ以外→other
+  function familyOf(name) {
+    if (name.indexOf("TRS") >= 0) return "blue";
+    if (name.indexOf("RAH") >= 0) return "green";
+    if (name.indexOf("お誕生日") >= 0 || name.indexOf("誕生") >= 0) return "red";
+    return "other";
+  }
+  // 送付方法違い（_メール便 等）だけの派生は同じ色にまとめる
+  function colorKey(name) {
+    return (name || "").trim().replace(/[_ ]*(メール便|CF放映地域|北海道)$/, "");
+  }
+  function computeFamilyColors() {
+    familyColors = {};
+    const used = { red: 1, blue: 1, green: 1, other: 0 };   // idx0 は主要施策に予約
+    const seen = new Set();
+    ["active", "carryNext", "carryFuture"].forEach(k => (state.model[k] || []).forEach(m => {
+      const key = colorKey(m.baseName); if (!key || seen.has(key)) return; seen.add(key);
+      let fam, idx;
+      if (FIXED[key]) { fam = FIXED[key][0]; idx = FIXED[key][1]; }
+      else { fam = familyOf(key); idx = used[fam]++; }
+      const pal = FAMPAL[fam]; familyColors[key] = pal[idx % pal.length];
+    }));
+  }
+  function familyColorOf(m) { const key = colorKey(m.baseName); return key ? familyColors[key] : null; }
+  function lightenHex(hex, amt) {
+    const h = hex.replace("#", ""); const r = parseInt(h.slice(0,2),16), g = parseInt(h.slice(2,4),16), b = parseInt(h.slice(4,6),16);
+    const mix = v => Math.round(v + (255 - v) * amt);
+    return `rgb(${mix(r)},${mix(g)},${mix(b)})`;
+  }
+  // 施策名変更時：全行の色を即時に付け替え（再描画せずフォーカス維持）
+  function applyFamilyColors() {
+    computeFamilyColors();
+    ["active", "carryNext", "carryFuture"].forEach(k => (state.model[k] || []).forEach(m => {
+      const tr = document.querySelector(`tr[data-row="${m.id}"]`); if (!tr) return;
+      const fc = familyColorOf(m);
+      if (fc) { tr.classList.add("fam-row"); tr.style.setProperty("--band", fc); }
+      else { tr.classList.remove("fam-row"); tr.style.removeProperty("--band"); }
+      if (state.expanded[m.id]) {
+        const det = tr.nextElementSibling;
+        if (det && det.classList.contains("detail-row")) {
+          const cell = det.querySelector("td");
+          if (cell) {
+            if (fc) { cell.style.boxShadow = "inset 6px 0 0 " + fc; cell.style.borderBottom = "2px solid " + fc; cell.style.background = lightenHex(fc, 0.85); }
+            else { cell.style.boxShadow = ""; cell.style.borderBottom = ""; cell.style.background = ""; }
+          }
+        }
+      }
+    }));
+  }
+
+  function renderBody() {
+    const root = $("#board"); root.innerHTML = "";
+    if (!S.isConnected()) { root.append(el("div", { class: "placeholder" }, "右上「📁 共有フォルダに接続」で、チームの共有フォルダを選んでください。保存データ（各月のJSON）がそこに読み書きされます。")); return; }
+    if (!state.model) { root.append(el("div", { class: "placeholder" }, "「対象月」で月を選ぶか、「＋ 新規月」で作成してください。")); return; }
+    computeFamilyColors();
+    root.append(renderMeasureSection("active", "今月実施（施策）", "calendar-check"));
+    root.append(renderCrossMonthPanel());
+    root.append(renderCancelLog());
+    root.append(renderMeasureSection("carryNext", "アイデア欄", "bulb"));
+  }
+  // 施策名フィルター中に、過去3ヶ月分の同名施策を月ごとに並べて表示（その場で編集・自動保存可）
+  function crossMonthTargets() {
+    if (!state.month) return [];
+    return [1, 2, 3].map(n => monthsBeforeYYYYMM(state.month, n));
+  }
+  async function ensureCrossMonthLoaded(month) {
+    if (state.crossMonth[month] !== undefined) return;
+    state.crossMonth[month] = null;   // 読み込み中〜対象なし、の間は一旦nullにして多重読み込みを防止
+    try {
+      const months = await S.listMonths();
+      if (!months.includes(month)) return;
+      const raw = await S.readMonth(month);
+      if (!raw) return;
+      const model = normalize(raw);
+      state.crossMonth[month] = { model, baseline: JSON.parse(JSON.stringify(model)), dirty: false, saving: false, timer: null };
+      if (state.tab === "list") autoRefresh("body");   // 入力中に読み込みが終わっても表を作り直さない
+    } catch (e) { /* 読み込めなければ「対象なし」として静かに諦める */ }
+  }
+  // 過去月比較の欄も自動保存はせず、未保存の印を付けるだけ（「保存」ボタンでまとめて書き込む）
+  function scheduleCrossSave(month) {
+    const entry = state.crossMonth[month]; if (!entry) return;
+    entry.dirty = true; entry.seq = (entry.seq || 0) + 1;
+    updateSaveBtn();
+  }
+  async function doCrossSave(month) {
+    const entry = state.crossMonth[month]; if (!entry) return;
+    entry.saving = true;
+    const seq = entry.seq || 0;
+    entry.model.updatedAt = new Date().toISOString(); entry.model.updatedBy = state.user;
+    try {
+      // 本体の保存と同じ3-way merge。過去月も複数人が同時に開いていることがあるため、
+      // 自分が触っていない箇所は共有フォルダの最新を残す（丸ごと上書きすると他の人の入力が戻ってしまう）
+      let diskRaw = null;
+      try { diskRaw = await S.readMonth(month); } catch (e) {}
+      const disk = diskRaw ? normalize(diskRaw) : entry.model;
+      const merged = mergeModels(entry.baseline || entry.model, entry.model, disk);
+      const importedOthers = JSON.stringify(merged) !== JSON.stringify(entry.model);
+      const payload = JSON.parse(JSON.stringify(merged));
+      await S.writeMonth(month, payload);
+      syncObjectInPlace(entry.model, merged);
+      entry.baseline = payload;
+      // 書き込み待ちの間の入力は保存できていないため、未保存のまま残す
+      entry.dirty = ((entry.seq || 0) !== seq);
+      updateSaveBtn();
+      if (importedOthers && state.tab === "list") autoRefresh("body");
+    }
+    catch (e) {
+      console.error("[cross-month save] 保存に失敗:", e);
+      state.saveError = (e && e.message) ? e.message : String(e);
+      updateSavedAt(); updateSaveBtn();
+    }
+    entry.saving = false;
+  }
+  function flushCrossMonthSaves() {
+    Object.keys(state.crossMonth).forEach(mo => { const e = state.crossMonth[mo]; if (e && e.dirty) doCrossSave(mo); });
+  }
+  // 過去月の入力欄は#board委譲リスナ（markDirty等）の対象外にするため、必ずバブリングを止める
+  function crossInputEvent(inp, type, handler) { inp.addEventListener(type, e => { e.stopPropagation(); handler(e); }); }
+  // 過去月の1行（本体の施策一覧と同じ列構成・バランスで表示。ドラッグ・選択・コピー・ハイライト・中止操作は無し。
+  // 展開で詳細も編集可）
+  function crossMonthRow(month, m, no) {
+    const tr = el("tr", {});
+    const td = (c, cls) => { const x = el("td", cls ? { class: cls } : {}); x.append(c); return x; };
+    const selKey = month + ":" + m.id;
+    const ck = state.crossExpanded[selKey];
+    const exp = el("button", { class: "iconbtn cm-exp" + (ck ? " open" : "") }, icon(ck ? "chevron-down" : "chevron-right"));
+    exp.addEventListener("click", e => { e.stopPropagation(); state.crossExpanded[selKey] = !ck; renderBody(); });
+    // 選択チェック：本体と同じ「ドラッグで連続チェック」操作。選択中に「まとめて開く/閉じる」が使える
+    const chk = el("input", { type: "checkbox", class: "rowsel", title: "選択（ドラッグでまとめてチェック）" });
+    chk.checked = state.crossSelected.has(selKey);
+    const setChecked = (on) => { chk.checked = on; if (on) state.crossSelected.add(selKey); else state.crossSelected.delete(selKey); tr.classList.toggle("selected", on); updateCrossSelBar(); };
+    let mouseHandled = false;
+    chk.addEventListener("mousedown", e => { e.stopPropagation(); e.preventDefault(); mouseHandled = true; state.crossDragCheckOn = !chk.checked; setChecked(state.crossDragCheckOn); document.body.classList.add("no-usersel"); });
+    chk.addEventListener("click", e => { e.stopPropagation(); if (mouseHandled) { e.preventDefault(); mouseHandled = false; } });
+    chk.addEventListener("mouseenter", () => { if (state.crossDragCheckOn != null) setChecked(state.crossDragCheckOn); });
+    if (state.crossSelected.has(selKey)) tr.classList.add("selected");
+    const dragCell = el("td", { class: "c-drag" }, chk, exp);
+    tr.append(dragCell);
+    tr.append(el("td", { class: "c-no" }, String(no)));
+    tr.append(td(el("div", {}, m.baseName || "(無題)"), "w-name"));
+    const ownIn = el("input", { class: "w-own", value: m.owner || "" });
+    crossInputEvent(ownIn, "input", () => { m.owner = ownIn.value; scheduleCrossSave(month); });
+    tr.append(td(ownIn));
+    const kindSel = pick(m, "kind", M.kinds, { class: "w-kind" });
+    crossInputEvent(kindSel, "change", () => { m.kind = kindSel.value; scheduleCrossSave(month); });
+    tr.append(td(kindSel));
+    const lmSel = pick(m, "listMethod", M.listMethods, { class: "w-lm" });
+    crossInputEvent(lmSel, "change", () => { m.listMethod = lmSel.value; scheduleCrossSave(month); });
+    tr.append(td(lmSel));
+    const dlvIn = el("input", { class: "w-souf", inputmode: "numeric", value: m.delivery ?? "100" });
+    const takeCrossDlv = () => { const v = toHalfWidthNum(dlvIn.value).replace(/[^0-9]/g, ""); if (dlvIn.value !== v) dlvIn.value = v; m.delivery = v; scheduleCrossSave(month); };
+    crossInputEvent(dlvIn, "input", e => { if (e.isComposing) return; takeCrossDlv(); });
+    crossInputEvent(dlvIn, "compositionend", takeCrossDlv);
+    tr.append(el("td", {}, el("div", { class: "delivery-field" }, dlvIn, el("span", { class: "pct-suffix" }, "%"))));
+    const p3In = numField(m, "p3", true, "w-p3");
+    crossInputEvent(p3In, "input", () => scheduleCrossSave(month));
+    tr.append(td(p3In));
+    const priIn = el("input", { class: "w-pri", type: "number", min: "1", value: m.priority || "" });
+    crossInputEvent(priIn, "input", () => { m.priority = priIn.value; scheduleCrossSave(month); });
+    tr.append(td(priIn));
+    const cntIn = numField(m, "estimatedCount", false, "w-cnt");
+    crossInputEvent(cntIn, "input", () => scheduleCrossSave(month));
+    tr.append(td(cntIn));
+    const offIn = el("input", { class: "namein", value: m.officialName || derive(m, month).fullName });
+    crossInputEvent(offIn, "input", () => { m.officialName = offIn.value; scheduleCrossSave(month); });
+    tr.append(td(offIn, "c-derived"));
+    return tr;
+  }
+  // 過去月の展開詳細（本体の detailRow() と同じ項目構成。#board委譲リスナへは伝播させない軽量実装）
+  function crossMonthDetail(month, m) {
+    const tr = el("tr", { class: "detail-row" });
+    const cell = el("td", { colspan: "11" });
+    const box = el("div", { class: "detail" });
+    const grid = el("div", { class: "detail-grid" });
+    const mkTa = (label, f, cls, placeholder) => {
+      const w = el("div", { class: "dw-field " + cls });
+      w.append(el("div", { class: "dw-lab" }, label));
+      const ta = el("textarea", { class: "d-note", rows: "1", placeholder: placeholder || "" }); ta.value = m[f] || "";
+      const grow = () => { ta.style.height = "auto"; ta.style.height = Math.max(30, ta.scrollHeight) + "px"; };
+      crossInputEvent(ta, "input", () => { m[f] = ta.value; grow(); scheduleCrossSave(month); });
+      w.append(ta); setTimeout(grow, 0);
+      return w;
+    };
+    const mkIn = (label, f, cls, placeholder) => {
+      const w = el("div", { class: "dw-field " + cls });
+      w.append(el("div", { class: "dw-lab" }, label));
+      const i = el("input", { value: m[f] || "", placeholder: placeholder || "" });
+      crossInputEvent(i, "input", () => { m[f] = i.value; scheduleCrossSave(month); });
+      w.append(i);
+      return w;
+    };
+    const wOrig = el("div", { class: "dw-field col-origcode" });
+    wOrig.append(el("div", { class: "dw-lab" }, "元素材コード"));
+    const pair = el("div", { class: "origcode-pair" });
+    [["origCode1", "①"], ["origCode2", "②"]].forEach(([f, ph]) => {
+      const i = el("input", { class: "origcode-in", value: m[f] || "", placeholder: ph });
+      crossInputEvent(i, "input", () => { m[f] = i.value; scheduleCrossSave(month); });
+      pair.append(i);
+    });
+    wOrig.append(pair);
+    const wSpec = el("div", { class: "dw-field col-spec" });
+    wSpec.append(el("div", { class: "dw-lab" }, "仕様"));
+    const specSel = el("select", {});
+    ["Z圧着", "A6はがき"].forEach(v => { const op = el("option", { value: v }, v); if ((m.spec || "Z圧着") === v) op.selected = true; specSel.append(op); });
+    crossInputEvent(specSel, "change", () => { m.spec = specSel.value; scheduleCrossSave(month); });
+    wSpec.append(specSel);
+    const wProdBenefit = el("div", { class: "dw-stack col-prodbenefit" });
+    wProdBenefit.append(mkIn("掲載商品", "products", "col-prod"), mkIn("特典", "benefit", "col-benefit"));
+    const wFixSpec = el("div", { class: "dw-stack col-fixspec" });
+    const fixWrap = mkIn("FIX時期", "roFixDate", "col-fix", "yyyy/mm/dd");
+    const fixInp = fixWrap.querySelector("input");
+    fixInp.addEventListener("blur", () => { fixInp.value = normalizeDateSlashes(fixInp.value); m.roFixDate = fixInp.value; });
+    wFixSpec.append(fixWrap, wSpec);
+    grid.append(mkTa("リスト条件", "note", "col-note"), mkTa("施策概要", "supplement", "col-supp"), wOrig, mkTa("補足", "remark", "col-remark"), mkTa("補足_特別対応（印刷会社申し送り）", "printerNote", "col-printernote"), wProdBenefit, wFixSpec);
+    box.append(grid); cell.append(box); tr.append(cell);
+    return tr;
+  }
+  function renderCrossMonthPanel() {
+    const names = state.filters.baseName;
+    const wrap = el("div", { class: "cross-month" });
+    if (!names || !names.length) { state.crossSelected.clear(); updateCrossSelBar(); return wrap; }
+    wrap.append(el("div", { class: "sec-head" }, el("h2", {}, icon("history"), " 過去の同名施策（直近3ヶ月・その場で編集可）")));
+    crossMonthTargets().forEach(month => {
+      const entry = state.crossMonth[month];
+      if (entry === undefined) { ensureCrossMonthLoaded(month); wrap.append(el("div", { class: "cross-month-card loading" }, `${window.monthLabel(month)}…読み込み中`)); return; }
+      if (entry === null) return;   // 共有フォルダにその月のデータが無い＝静かに省略
+      const rows = entry.model.active.filter(m => names.includes(m.baseName || ""));
+      if (!rows.length) return;
+      const card = el("div", { class: "cross-month-card" });
+      card.append(el("div", { class: "cross-month-head" }, `${window.monthLabel(month)}${entry.saving ? "（保存中…）" : ""}`, el("span", { class: "sec-count" }, String(rows.length))));
+      const table = el("table", { class: "grid cross-month-table" });
+      const th = (label, width) => el("th", width ? { style: `width:${width}px` } : {}, label);
+      const thr = el("tr", {}, th("", 94), th("No.", 32), th("施策名", 150), th("担当", 76), th("種別", 78), th("取得", 78), th("郵便割合", 70), th("P3/List", 56), th("優先", 48), th("件数", 70), th("正式名（編集可）"));
+      table.append(el("thead", {}, thr));
+      const tb = el("tbody", {});
+      rows.forEach((m, i) => {
+        tb.append(crossMonthRow(month, m, i + 1));
+        if (state.crossExpanded[month + ":" + m.id]) tb.append(crossMonthDetail(month, m));
+      });
+      table.append(tb);
+      card.append(table);
+      wrap.append(card);
+    });
+    updateCrossSelBar();
+    return wrap;
+  }
+  // 中止・振替ログ：中止になった施策と、そのリストの振替先・件数・理由を後からまとめて追える記録
+  function renderCancelLog() {
+    const wrap = el("section", { class: "sec cancel-log" });
+    const cancelled = state.model.active.filter(m => m.cancelled)
+      .sort((a, b) => (b.cancelDate || "").localeCompare(a.cancelDate || ""));
+    wrap.append(el("div", { class: "sec-head" }, el("h2", {}, icon("ban"), " 中止・振替ログ", el("span", { class: "sec-count" }, String(cancelled.length)))));
+    if (!cancelled.length) { wrap.append(el("div", { class: "cancel-log-empty" }, "中止した施策はありません。")); return wrap; }
+    cancelled.forEach(m => {
+      const dest = m.reallocateToId ? findMeasure(m.reallocateToId) : null;
+      const card = el("div", { class: "cancel-log-card" });
+      card.append(el("div", { class: "cancel-log-top" },
+        el("span", { class: "cancel-log-name" }, m.baseName || "(無題)"),
+        el("span", { class: "cancel-log-date" }, [m.cancelDate, m.owner].filter(Boolean).join("・"))));
+      if (m.cancelReason) card.append(el("div", { class: "cancel-log-reason" }, m.cancelReason));
+      if (dest) {
+        card.append(el("div", { class: "cancel-flow" },
+          el("span", { class: "cancel-chip from" }, `${m.baseName || "(無題)"}（中止・${(parseInt(m.reallocateCount, 10) || 0).toLocaleString()}件）`),
+          icon("arrow-right"),
+          el("span", { class: "cancel-chip to" }, `${dest.baseName || "(無題)"} に合算済み`)));
+      }
+      wrap.append(card);
+    });
+    return wrap;
+  }
+  function rerender() {
+    renderSummary(); renderLockBar(); updateSavedAt(); updateSaveBtn(); updateUndoBtn(); updateTitle(); updateSelBar(); updateMailDate(); renderKickoffCard();
+    if (state.tab === "list") renderBody(); else renderScheduleBoard();
+  }
+  // ===== 入力中の自動再描画を待たせる =====
+  // 自動保存で他の人の更新を取り込んだ時・共有フォルダのポーリング・過去月の読み込み完了などで
+  // 表を作り直すと、入力途中の欄やIMEの変換が消えて「文字が打てない」状態になる。
+  // 入力欄にフォーカスがある／変換中はいったん保留し、入力から離れた時にまとめて反映する。
+  let imeComposing = false, pendingAuto = null, pendingTimer = null;   // pendingAuto: "full" | "body" | null
+  function isTypingNow() {
+    if (imeComposing) return true;
+    const a = document.activeElement;
+    return !!(a && (a.tagName === "INPUT" || a.tagName === "TEXTAREA" || a.tagName === "SELECT" || a.isContentEditable));
+  }
+  function runAuto(kind) { if (kind === "full") rerender(); else renderBody(); }
+  function clearPendingAuto() { pendingAuto = null; if (pendingTimer) { clearInterval(pendingTimer); pendingTimer = null; } }
+  function autoRefresh(kind) {
+    if (isTypingNow()) {
+      pendingAuto = (pendingAuto === "full" || kind === "full") ? "full" : "body";
+      // フォーカスイベントが来ない場合もあるため、入力が終わったかを定期的に見て反映する
+      if (!pendingTimer) pendingTimer = setInterval(tryFlushAuto, 800);
+      return;
+    }
+    clearPendingAuto(); runAuto(kind);
+  }
+  function tryFlushAuto() {
+    if (!pendingAuto) { clearPendingAuto(); return; }
+    if (isTypingNow()) return;   // まだ入力中なら次の機会に回す
+    const k = pendingAuto; clearPendingAuto(); runAuto(k);
+  }
+  // 別の入力欄へ移動しただけの時はまだ待つ（フォーカスが落ち着くのを待ってから判定する）
+  function flushAutoRefresh() { if (pendingAuto) setTimeout(tryFlushAuto, 150); }
+  function updateTitle() {
+    const e = $("#planTitle"); if (e) e.textContent = state.model ? (state.model.title || "") : "";
+    const b = $("#brandTitle"); if (b) b.textContent = (state.model && state.month) ? (parseInt(state.month.slice(4), 10) + "月") : "DM企画サマリー";
+  }
+  function updateMailDate() { const e = $("#mailDate"); if (!e) return; e.value = state.model ? (state.model.mailDate || "") : ""; e.disabled = !state.model; }
+
+  // ============ スケジュール（デザイン／リスト） ============
+  // 施策名グループ単位のカレンダー型ガント。日付は投函日／データ入稿日／宛名入稿日から自動計算し、
+  // 手動でドラッグして直した項目だけを model.schedule.overrides に差分保存する（他は毎回再計算＝保存しない）。
+  const SCHED = {
+    design: {
+      // オリエンは削除。基本情報入力・QR紐づけ・KUROSHIO登録完了日・初校・2校・校了は、
+      // 「ざっくり全体感が分かる共通線」と「施策ごとに個別調整できる丸」を両方持たせるため、
+      // 通常のstepsに戻しつつ、下のcommonLinesから同じstepIndexを指す形で線を重ねて表示する。
+      steps: ["RO決定", "企画連携", "基本情報入力", "QR紐づけ", "KUROSHIO登録完了日", "初校", "2校", "校了", "入稿"],
+      owners: ["CRM", "CRM", "デザイン", "デザイン", "デザイン", "デザイン", "デザイン", "CRM", "デザイン"],
+      // 企画連携・初校・2校・校了は、データ入稿日ではなく「RO決定」を起点に決める（入稿日が月によって大きく動いても、
+      // RO決定→企画連携→初校→2校の順序が逆転しないようにするため）。起点の日付を手で動かすと、後続も一緒に動く。
+      // 入稿（最終ステップ）だけデータ入稿日そのもの。
+      offsets: [null, null, null, null, null, null, null, null, 0],
+      chain: {
+        1: { from: 0, days: 1, dir: "next" },   // 企画連携 = RO決定の翌営業日
+        5: { from: 1, days: 3, dir: "prev" },   // 初校 = 企画連携の3日後
+        6: { from: 5, days: 3, dir: "prev" },   // 2校 = 初校の3日後
+        7: { from: 0, days: 15, dir: "prev" },  // 校了 = RO決定の15日後
+      },
+      specialDates: {
+        0: { day: 24, monthsBefore: 2 },    // RO決定：発送月の2か月前・24日
+        2: { day: 11, monthsBefore: 2 },    // 基本情報入力
+        3: { day: 18, monthsBefore: 2 },    // QR紐づけ
+        4: { day: 20, monthsBefore: 1 },    // KUROSHIO登録完了日
+      },
+      gateIndex: 1,   // 企画連携チェック（鍵）の対象ステップ
+      // 全施策共通の縦線：対応するstepIndexの「一番早い施策の日付」を線の位置として表示し、
+      // 線をドラッグするとそのステップの全施策名グループの日付を同じ日数ぶん一括シフトする
+      // （施策ごとの丸は個別にも動かせる。まとめて動かす、との併用も可）
+      commonLines: [
+        { key: "roDecide", stepIndex: 0, label: "RO決定", color: "#7c3aed" },
+        { key: "kikaku", stepIndex: 1, label: "企画連携", color: "#7c3aed" },
+        { key: "basicInfo", stepIndex: 2, label: "基本情報入力", labelLines: ["基本情報入力", "QR作成", "価格表作成"], color: "#7c3aed" },
+        { key: "qrLink", stepIndex: 3, label: "QR紐づけ", color: "#7c3aed" },
+        { key: "kuroshio", stepIndex: 4, label: "KUROSHIO登録完了日", color: "#15803d" },
+        { key: "firstProof", stepIndex: 5, label: "初校", color: "#0891b2" },
+        { key: "secondProof", stepIndex: 6, label: "2校", color: "#0891b2" },
+        { key: "finalProof", stepIndex: 7, label: "校了", color: "#0891b2" },
+      ],
+      axisField: "designAxis", axisLabel: "データ入稿日", axisColor: "#0891b2",
+      gateItems: ["PMとの確認", "PMからの訴求優先度", "過去施策からの設計根拠", "表現の法務確認", "価格・CTAの他チャネル整合"],
+    },
+    tci: {
+      steps: ["依頼書格納", "GV共有", "スコアリング", "件数報告", "件数確定", "宛名入稿"],
+      owners: ["CRM", "TCI", "TCI", "TCI", "CRM", "TCI"],
+      offsetsAI: [53, 39, 36, 35, 32, 0],
+      offsetsKiro: [22, null, null, 11, 10, 0],   // 既ロはGV工程なし
+      axisField: "tciAxis", axisLabel: "宛名入稿日",
+      gateItems: ["DM企画決定（RO・テスト施策数、条件）", "DM掲載商品情報・リスト抽出日データ作成", "赤字/黒字の補正値情報の算出→GVへ共有", "使用件数決定"],
+    },
+  };
+  const KICKOFF_ITEMS = ["施策数と優先順位の回答", "印刷会社への納品日の確認", "WOWセール購入PINの格納", "各施策の条件確認（依頼シート）"];
+  const CW = 26, LBL = 250;
+
+  // 自由入力の日付文字列内の yyyy-mm-dd を yyyy/mm/dd に統一する（FIX時期など、範囲や複数日付が混在するテキストにも対応）
+  function normalizeDateSlashes(v) { return (v || "").replace(/(\d{4})-(\d{1,2})-(\d{1,2})/g, "$1/$2/$3"); }
+  function isoOf(d) { const p = n => String(n).padStart(2, "0"); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; }
+  function parseISO(iso) { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ""); return m ? new Date(+m[1], +m[2] - 1, +m[3]) : null; }
+  function todayISO() { return isoOf(new Date()); }
+  function addDaysISO(iso, delta) { const d = parseISO(iso); if (!d) return ""; d.setDate(d.getDate() + delta); return isoOf(d); }
+  function diffDaysISO(a, b) { const da = parseISO(a), db = parseISO(b); if (!da || !db) return 0; return Math.round((db - da) / 86400000); }
+  function fmtMD(iso) { const d = parseISO(iso); return d ? `${d.getMonth() + 1}/${d.getDate()}` : ""; }
+
+  function schedStore() { return state.model.schedule; }
+  // 施策名グループ単位のキー（同じ施策名の中のRO①②・テスト等は必ず同じ日付で運用するため、
+  // 個別施策のIDではなく施策名で保存する＝グループ内で日付がバラつくことがなくなる）
+  function stepKey(m, view, i) { return (m.baseName || "").trim() + ":" + view + ":" + i; }
+  // 「発送月の◯か月前・△日（土日は前倒しで直前の営業日）」形式の固定日付
+  function monthsBeforeYYYYMM(yyyymm, n) {
+    let y = parseInt(yyyymm.slice(0, 4), 10), mo = parseInt(yyyymm.slice(4, 6), 10);
+    mo -= n;
+    while (mo <= 0) { mo += 12; y -= 1; }
+    return `${y}${String(mo).padStart(2, "0")}`;
+  }
+  // ===== 日本の祝日（土日・シルバーウィーク等の祝日を挟んだ「国民の休日」も含む）を計算し、
+  // 自動計算した日付が休日に当たる場合は前倒しで直前の営業日にする =====
+  const HOLIDAY_CACHE = {};
+  function nthMondayOfMonth(year, month, n) {
+    const d = new Date(year, month - 1, 1);
+    let count = 0;
+    while (true) {
+      if (d.getDay() === 1) { count++; if (count === n) return new Date(d); }
+      d.setDate(d.getDate() + 1);
+    }
+  }
+  function equinoxDay(year, isSpring) {
+    const base = isSpring ? 20.8431 : 23.2488;
+    return Math.floor(base + 0.242194 * (year - 1980) - Math.floor((year - 1980) / 4));
+  }
+  function holidaySetForYear(year) {
+    if (HOLIDAY_CACHE[year]) return HOLIDAY_CACHE[year];
+    const set = new Set();
+    const add = (m, d) => set.add(isoOf(new Date(year, m - 1, d)));
+    add(1, 1); add(2, 11); add(2, 23); add(4, 29); add(5, 3); add(5, 4); add(5, 5);
+    add(8, 11); add(11, 3); add(11, 23);
+    set.add(isoOf(nthMondayOfMonth(year, 1, 2)));    // 成人の日
+    set.add(isoOf(nthMondayOfMonth(year, 7, 3)));    // 海の日
+    set.add(isoOf(nthMondayOfMonth(year, 9, 3)));    // 敬老の日
+    set.add(isoOf(nthMondayOfMonth(year, 10, 2)));   // スポーツの日
+    add(3, equinoxDay(year, true));    // 春分の日
+    add(9, equinoxDay(year, false));   // 秋分の日
+    // 振替休日：祝日が日曜の場合、その後の最初の非祝日の平日を休日にする
+    [...set].forEach(iso => {
+      const d = parseISO(iso);
+      if (d.getDay() === 0) {
+        const sub = new Date(d); sub.setDate(sub.getDate() + 1);
+        while (set.has(isoOf(sub))) sub.setDate(sub.getDate() + 1);
+        set.add(isoOf(sub));
+      }
+    });
+    // 国民の休日：前後を祝日に挟まれた（日曜でない）平日（例：シルバーウィークの間の日）
+    [...set].forEach(iso => {
+      const d = parseISO(iso);
+      const between = new Date(d); between.setDate(between.getDate() + 1);
+      const next = new Date(d); next.setDate(next.getDate() + 2);
+      if (set.has(isoOf(next)) && !set.has(isoOf(between)) && between.getDay() !== 0) set.add(isoOf(between));
+    });
+    HOLIDAY_CACHE[year] = set;
+    return set;
+  }
+  function isBizDay(iso) {
+    const d = parseISO(iso); if (!d) return true;
+    if (d.getDay() === 0 || d.getDay() === 6) return false;
+    return !holidaySetForYear(d.getFullYear()).has(iso);
+  }
+  function prevBizDay(iso) {
+    let cur = iso;
+    while (!isBizDay(cur)) cur = addDaysISO(cur, -1);
+    return cur;
+  }
+  function nextBizDay(iso) {
+    let cur = iso;
+    while (!isBizDay(cur)) cur = addDaysISO(cur, 1);
+    return cur;
+  }
+  function bizDayOnOrBefore(yyyymm, day) {
+    const y = parseInt(yyyymm.slice(0, 4), 10), mo = parseInt(yyyymm.slice(4, 6), 10);
+    return prevBizDay(isoOf(new Date(y, mo - 1, day)));
+  }
+  function autoStepDate(view, m, i) {
+    const cfg = SCHED[view];
+    if (cfg.specialDates && cfg.specialDates[i] && state.month) {
+      const sd = cfg.specialDates[i];
+      return bizDayOnOrBefore(monthsBeforeYYYYMM(state.month, sd.monthsBefore), sd.day);
+    }
+    if (cfg.chain && cfg.chain[i]) {
+      const c = cfg.chain[i];
+      const base = stepDate(view, m, c.from);   // 起点が手で動かされていれば、その日付に追従する
+      if (!base) return "";
+      const d = addDaysISO(base, c.days);
+      return c.dir === "next" ? nextBizDay(d) : prevBizDay(d);
+    }
+    const axis = state.model[cfg.axisField];
+    if (!axis) return "";
+    const offsets = view === "tci" ? (m.listMethod === "AI" ? cfg.offsetsAI : cfg.offsetsKiro) : cfg.offsets;
+    const off = offsets[i];
+    if (off == null) return "";
+    if (off === 0) return axis;   // 最終ステップ＝入稿/宛名入稿＝軸そのもの（前倒し補正の対象外）
+    return prevBizDay(addDaysISO(axis, -off));
+  }
+  function stepDate(view, m, i) { const ov = schedStore().overrides[stepKey(m, view, i)]; return ov || autoStepDate(view, m, i); }
+  function stepDone(view, m, i) { return !!schedStore().done[stepKey(m, view, i)]; }
+  function setStepDone(view, m, i, on) { schedStore().done[stepKey(m, view, i)] = on; }
+  function setStepOverride(view, m, i, iso) {
+    const auto = autoStepDate(view, m, i);
+    if (iso === auto) delete schedStore().overrides[stepKey(m, view, i)];
+    else schedStore().overrides[stepKey(m, view, i)] = iso;
+    setStepDone(view, m, i, false);   // 日付を動かしたら未完了に戻す
+  }
+  // 全施策共通の縦線（あるステップの「一番早い施策の日付」を代表値として表示）。
+  // 線をドラッグすると、そのステップの全施策名グループの日付を同じ日数ぶん一括シフトする
+  // （施策ごとに既にバラつきがあっても、それぞれの相対的なズレは保ったまま全体をスライドできる）
+  function stepLineDate(view, i) {
+    const dates = scheduleGroups().map(g => stepDate(view, g.children[0], i)).filter(Boolean).sort();
+    return dates.length ? dates[0] : "";
+  }
+  function setStepLineDate(view, i, newDate) {
+    const cur = stepLineDate(view, i); if (!cur) return;
+    const delta = diffDaysISO(cur, newDate); if (!delta) return;
+    // 個別の丸のドラッグはロック中でも日付を動かせる仕様のため、共通線も同じく全グループを動かす
+    // （企画連携ゲートは「完了操作（クリック）」だけを塞ぐもので、日付の見込み調整までは塞がない）
+    scheduleGroups().forEach(g => {
+      const m = g.children[0];
+      const d = stepDate(view, m, i);
+      if (d) setStepOverride(view, m, i, addDaysISO(d, delta));
+    });
+  }
+  // 全施策共通の縦線（QR紐づけ完了日・KUROSHIO登録完了日など）：施策ごとではなく月に1つの日付
+  function milestoneKey(view, key) { return "milestone:" + view + ":" + key; }
+  // ml.offsetがある場合（初校・2校・校了など）はデータ入稿日からの逆算日数、無ければ従来通り「発送月のNか月前のD日」
+  function milestoneAutoDate(view, ml) {
+    if (ml.offset != null) {
+      const axis = state.model[SCHED[view].axisField];
+      if (!axis) return "";
+      if (ml.offset === 0) return axis;
+      return prevBizDay(addDaysISO(axis, -ml.offset));
+    }
+    if (!state.month) return "";
+    return bizDayOnOrBefore(monthsBeforeYYYYMM(state.month, ml.monthsBefore), ml.day);
+  }
+  function milestoneDate(view, ml) { const ov = schedStore().overrides[milestoneKey(view, ml.key)]; return ov || milestoneAutoDate(view, ml); }
+  function setMilestoneDate(view, ml, iso) {
+    const auto = milestoneAutoDate(view, ml);
+    if (iso === auto) delete schedStore().overrides[milestoneKey(view, ml.key)];
+    else schedStore().overrides[milestoneKey(view, ml.key)] = iso;
+  }
+  function groupGate(name) { const g = schedStore().gates; if (!g[name]) g[name] = ["", "", "", "", ""]; return g[name]; }
+  function listGateArr() { return schedStore().listGate; }
+  function kickoffObj() { return schedStore().kickoff; }
+  // メモ：既定の工程は m/g のキー、追加した工程（カスタム）は "custom:<id>" をキーにする
+  function noteKeyFor(view, g, m, i) { return m ? stepKey(m, view, i) : `g:${g.name}:${view}:${i}`; }
+  function getNote(key) { return schedStore().notes[key] || ""; }
+  function setNote(key, text) { const t = (text || "").trim(); if (t) schedStore().notes[key] = t; else delete schedStore().notes[key]; }
+  // カスタム工程（自分で追加した丸）：行（施策名グループ or 個別施策）ごとに何個でも追加できる
+  function rowKeyFor(g, m) { return m ? "m:" + m.id : "g:" + g.name; }
+  function customForRow(view, rowKey) { return schedStore().custom.filter(c => c.view === view && c.rowKey === rowKey); }
+  function addCustom(view, rowKey, label, date) {
+    const c = { id: uid(), view, rowKey, label: label || "予定", date, done: false };
+    schedStore().custom.push(c); return c;
+  }
+  function removeCustom(id) {
+    setNote("custom:" + id, "");
+    const arr = schedStore().custom; const i = arr.findIndex(c => c.id === id); if (i >= 0) arr.splice(i, 1);
+  }
+  function gateArrDone(arr) { return arr.every(x => x === "ok" || x === "na"); }
+  function gateLockActive(view, groupName) {
+    if (view === "design") return !gateArrDone(groupGate(groupName));
+    return false;   // リストスケジュール側は「依頼書格納」の鍵をやめ、他の工程と同じく自由に動かせるようにした
+  }
+  // 企画連携ゲートの5項目が全てOK/不要になったら、その工程自体を自動で完了(緑チェック)にする。
+  // 逆に一度完了にした後でも項目を戻して未完了状態にした場合は、鍵がかかった状態に揃えるため完了も戻す。
+  function syncGateDone(view, g) {
+    const cfg = SCHED[view]; if (cfg.gateIndex == null) return;
+    setStepDone(view, g.children[0], cfg.gateIndex, gateArrDone(groupGate(g.name)));
+  }
+
+  // 施策名グループを state.model.active から動的に生成（並び順＝企画サマリーと同じ表示順）
+  function scheduleGroups() {
+    const map = {}, order = [];
+    state.model.active.forEach(m => {
+      if (m.cancelled) return;   // 中止した施策はスケジュールに出さない（施策名グループ全体が中止なら行ごと消える）
+      const name = (m.baseName || "").trim(); if (!name) return;
+      if (!map[name]) { map[name] = { name, children: [] }; order.push(map[name]); }
+      map[name].children.push(m);
+    });
+    return order;
+  }
+  function stepVisualState(view, m, i, lockHere) {
+    const cfg = SCHED[view];
+    if (i === cfg.steps.length - 1) return "fix";   // 最終ステップ＝入稿/宛名入稿＝軸そのもの（操作不可）
+    if (lockHere && i === (cfg.gateIndex ?? 0)) return "lock";
+    if (stepDone(view, m, i)) return "done";
+    const d = stepDate(view, m, i); if (!d) return null;
+    if (diffDaysISO(d, todayISO()) > 0) return "late";
+    return "plan";
+  }
+  function customVisualState(c) {
+    if (c.done) return "done";
+    if (diffDaysISO(c.date, todayISO()) > 0) return "late";
+    return "plan";
+  }
+  // 表示中のスケジュールタブで「今日より前・未完了（＝late表示）」の工程をまとめて完了にする
+  function markAllPastDone() {
+    if (!state.editing) { blockEdit(); return; }
+    const view = state.tab; const cfg = SCHED[view];
+    if (!cfg) return;
+    let n = 0;
+    scheduleGroups().forEach(g => {
+      const lock = gateLockActive(view, g.name);
+      g.children.forEach(m => {
+        cfg.steps.forEach((_, i) => {
+          if (i === cfg.steps.length - 1) return;   // 入稿/宛名入稿(=軸そのもの)は対象外
+          if (stepVisualState(view, m, i, lock) === "late") { setStepDone(view, m, i, true); n++; }
+        });
+        customForRow(view, rowKeyFor(g, m)).forEach(c => { if (customVisualState(c) === "late") { c.done = true; n++; } });
+      });
+      customForRow(view, rowKeyFor(g, null)).forEach(c => { if (customVisualState(c) === "late") { c.done = true; n++; } });
+    });
+    if (n > 0) { markDirty(); renderScheduleBoard(); flash(`${n}件を完了にしました`); }
+    else flash("今日より前で未完了のものはありませんでした");
+  }
+  function scheduleRange(view) {
+    const cfg = SCHED[view], dates = [];
+    scheduleGroups().forEach(g => g.children.forEach(m => cfg.steps.forEach((_, i) => { const d = stepDate(view, m, i); if (d) dates.push(d); })));
+    const axis = state.model[cfg.axisField]; if (axis) dates.push(axis);
+    dates.push(todayISO());
+    if (!dates.length) return null;
+    dates.sort();
+    return { from: addDaysISO(dates[0], -3), to: addDaysISO(dates[dates.length - 1], 3) };
+  }
+  function xOf(range, iso) { return diffDaysISO(range.from, iso) * CW + CW / 2; }
+
+  function scheduleHeaderEl(range, dayCount) {
+    const hd = el("div", { class: "sg-hd" });
+    hd.append(el("div", { class: "sg-lbl", style: `width:${LBL}px` },
+      el("div", { class: "sg-mrow" }, el("div", { class: "sg-mcell", style: `width:${LBL}px` }, "施策名")),
+      el("div", { class: "sg-drow" }, el("div", { class: "sg-dcell", style: `width:${LBL}px` }, "企画サマリーと同じ並び順")),
+      el("div", { class: "sg-wrow" }, el("div", { class: "sg-wcell", style: `width:${LBL}px` }, ""))));
+    const days = el("div", {});
+    const mrow = el("div", { class: "sg-mrow" }), drow = el("div", { class: "sg-drow" }), wrow = el("div", { class: "sg-wrow" });
+    const WD = ["日", "月", "火", "水", "木", "金", "土"];
+    let d = parseISO(range.from), curMonth = null, monthCell = null, monthCount = 0;
+    for (let i = 0; i < dayCount; i++) {
+      const mo = d.getMonth() + 1;
+      if (mo !== curMonth) { if (monthCell) monthCell.style.width = (monthCount * CW) + "px"; monthCell = el("div", { class: "sg-mcell" }, mo + "月"); mrow.append(monthCell); curMonth = mo; monthCount = 0; }
+      monthCount++;
+      const we = !isBizDay(isoOf(d));
+      drow.append(el("div", { class: "sg-dcell" + (we ? " we" : ""), style: `width:${CW}px` }, String(d.getDate())));
+      wrow.append(el("div", { class: "sg-wcell" + (we ? " we" : ""), style: `width:${CW}px` }, WD[d.getDay()]));
+      d.setDate(d.getDate() + 1);
+    }
+    if (monthCell) monthCell.style.width = (monthCount * CW) + "px";
+    days.append(mrow, drow, wrow);
+    hd.append(days);
+    return hd;
+  }
+  // rowKey＝右クリックで追加するカスタム工程の行キー。指定すると空欄を右クリックしたときに追加メニューを出す
+  function trackCellsEl(range, dayCount, view, rowKey) {
+    const track = el("div", { class: "sg-track", style: `width:${dayCount * CW}px` });
+    let d = parseISO(range.from);
+    for (let i = 0; i < dayCount; i++) {
+      track.append(el("div", { class: "sg-tcell" + (!isBizDay(isoOf(d)) ? " we" : ""), style: `width:${CW}px`, "data-date": isoOf(d) }));
+      d.setDate(d.getDate() + 1);
+    }
+    if (view && rowKey) {
+      track.addEventListener("contextmenu", e => {
+        e.preventDefault();
+        if (!state.editing) { blockEdit(); return; }
+        const date = dateAtPoint(track, e);
+        openCtxMenu([{ label: `＋ ${fmtMD(date)} に工程を追加`, onClick: () => openAddCustomModal(view, rowKey, date) }], e.clientX, e.clientY);
+      });
+    }
+    return track;
+  }
+  // クリック位置がどの日のセルの上にあるかを求める。
+  // まずブラウザ自身のヒットテスト（e.target / elementFromPoint）でセルのdata-dateを直接読み取り、
+  // それでも取れない場合だけ座標計算にフォールバックする（zoom表示等でのpx丸め誤差の影響を受けない）。
+  function dateAtPoint(track, e) {
+    let cell = e.target && e.target.closest && e.target.closest(".sg-tcell");
+    if (!cell && document.elementFromPoint) { const el2 = document.elementFromPoint(e.clientX, e.clientY); cell = el2 && el2.closest && el2.closest(".sg-tcell"); }
+    if (cell && cell.dataset.date) return cell.dataset.date;
+    return fallbackDateAtX(track, e.clientX);
+  }
+  function fallbackDateAtX(track, clientX) {
+    const cells = track.querySelectorAll(".sg-tcell");
+    for (let i = 0; i < cells.length; i++) { if (clientX < cells[i].getBoundingClientRect().right) return cells[i].dataset.date; }
+    return cells.length ? cells[cells.length - 1].dataset.date : "";
+  }
+  function openCtxMenu(items, x, y) {
+    closeColMenu();
+    const menu = el("div", { id: "colMenu", class: "col-menu" });
+    menu.addEventListener("click", e => e.stopPropagation());
+    items.forEach(it => menu.append(el("button", { class: "cm-item", onclick: () => { closeColMenu(); it.onClick(); } }, it.label)));
+    document.body.append(menu);
+    menu.style.left = Math.min(x, window.innerWidth - menu.offsetWidth - 8) + "px";
+    menu.style.top = Math.min(y, window.innerHeight - menu.offsetHeight - 8) + "px";
+    setTimeout(() => document.addEventListener("click", closeColMenu), 0);
+  }
+  function openMemoModal(key, label) {
+    const box = el("div", {});
+    const ta = el("textarea", { rows: "4" });
+    ta.value = getNote(key);
+    box.append(labeled(`メモ（${label}）`, ta));
+    const save = () => { setNote(key, ta.value); markDirty(); closeModal(); renderScheduleBoard(); };
+    box.append(el("div", { class: "modal-actions" }, el("button", { class: "btn primary", onclick: save }, "保存")));
+    openModal("メモ", box);
+    setTimeout(() => ta.focus(), 0);
+  }
+  function openAddCustomModal(view, rowKey, date) {
+    const box = el("div", {});
+    const labelInp = el("input", { class: "modal-in", placeholder: "例：社内確認" });
+    box.append(labeled("ラベル", labelInp));
+    const dateInp = el("input", { class: "modal-in", type: "date", value: date });
+    box.append(labeled("日付", dateInp));
+    const memoTa = el("textarea", { rows: "3" });
+    box.append(labeled("メモ（任意）", memoTa));
+    const err = el("div", { class: "modal-err" });
+    const create = () => {
+      if (!dateInp.value) { err.textContent = "日付を入力してください。"; return; }
+      const c = addCustom(view, rowKey, labelInp.value.trim(), dateInp.value);
+      if (memoTa.value.trim()) setNote("custom:" + c.id, memoTa.value.trim());
+      markDirty(); closeModal(); renderScheduleBoard();
+    };
+    box.append(err, el("div", { class: "modal-actions" }, el("button", { class: "btn primary", onclick: create }, "追加")));
+    openModal("工程を追加", box);
+    setTimeout(() => labelInp.focus(), 0);
+  }
+  // ドラッグで日付を動かす／クリックで完了トグル／錠アイコンはゲートのポップアップを開く／右クリックでメモ・削除
+  function wireDot(dotEl, p, view, g, m) {
+    const key = p.custom ? ("custom:" + p.custom.id) : noteKeyFor(view, g, m, p.i);
+    dotEl.addEventListener("contextmenu", e => {
+      e.preventDefault(); e.stopPropagation();
+      if (!state.editing) { blockEdit(); return; }
+      const items = [{ label: getNote(key) ? "📝 メモを編集" : "📝 メモを追加", onClick: () => openMemoModal(key, p.label) }];
+      if (p.custom) items.push({ label: "🗑 このマークを削除", onClick: () => { removeCustom(p.custom.id); markDirty(); renderScheduleBoard(); } });
+      openCtxMenu(items, e.clientX, e.clientY);
+    });
+    if (p.st === "fix") return;
+    if (!state.editing) { dotEl.style.cursor = "default"; return; }
+    const targets = p.custom ? null : (m ? [m] : g.children);
+    dotEl.addEventListener("mousedown", e => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      // マウスの移動量から日数を出すのではなく、開始位置と現在位置が実際にどの日セルの上にあるかを
+      // それぞれ実測して差を取る（平均セル幅で割り算すると丸め誤差が蓄積してズレるため）。
+      // dotEl.style.left自体は論理px（CW基準）で管理しているので、位置の書き戻しはCWのまま。
+      const track = dotEl.parentElement;
+      const startDate = fallbackDateAtX(track, e.clientX);
+      const baseLeft = parseFloat(dotEl.style.left); let days = 0, moved = false;
+      dotEl.classList.add("drag");
+      function mv(ev) { const d = diffDaysISO(startDate, fallbackDateAtX(track, ev.clientX)); if (d !== 0) moved = true; days = d; dotEl.style.left = (baseLeft + days * CW) + "px"; }
+      function up() {
+        document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
+        dotEl.classList.remove("drag");
+        if (p.custom) {
+          if (moved) p.custom.date = addDaysISO(p.custom.date, days);
+          else p.custom.done = !p.custom.done;
+        } else if (moved) {
+          // 施策名グループの全施策は同じキー（施策名ベース）を共有するため、丸が実際に表示されている
+          // 位置の日付(p.mn)を基準に1回だけ計算する（施策ごとに現在値を読んで足し引きすると、
+          // 複数施策の値がまだ揃っていない時に最後に処理した施策の値で上書きされてズレる）
+          if (p.mn) setStepOverride(view, targets[0], p.i, addDaysISO(p.mn, days));
+        } else if (p.st === "lock") {
+          openGatePopover(view, g, dotEl); return;
+        } else {
+          const allDone = targets.every(mm => !stepDate(view, mm, p.i) || stepDone(view, mm, p.i));
+          targets.forEach(mm => { if (stepDate(view, mm, p.i)) setStepDone(view, mm, p.i, !allDone); });
+        }
+        markDirty(); renderScheduleBoard();
+      }
+      document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+    });
+  }
+  // ラベルの見た目上の横幅を実測し、近い（または同じ）日の工程同士でもラベルが重ならないよう
+  // 段（tier）を振り分ける。以前は同じ日の工程を「他N件」と1つにまとめていたが、工程の種類が
+  // 分からなくなるとの指摘があったため、1件ずつ個別の丸・ラベルとして表示しつつ段違いで避ける方式に変更
+  let __labelCtx = null;
+  function measureTextWidth(text, font) {
+    if (!__labelCtx) __labelCtx = document.createElement("canvas").getContext("2d");
+    __labelCtx.font = font;
+    return __labelCtx.measureText(text).width;
+  }
+  function labelPixelWidth(text) { return measureTextWidth(text, "9.5px 'Inter','Noto Sans JP',sans-serif"); }
+  function tagPixelWidth(text) { return measureTextWidth(text, "700 9.5px 'Inter','Noto Sans JP',sans-serif"); }
+  const TIER_H = 23;   // 1段分の高さ（丸+ラベル2行ぶん）
+  function layoutPoints(pts, range) {
+    const sorted = pts.slice().sort((a, b) => xOf(range, a.mn) - xOf(range, b.mn));
+    const tierRight = [];
+    return sorted.map(p => {
+      const x = xOf(range, p.mn);
+      const dateText = p.mn !== p.mx ? fmtMD(p.mn) + "〜" + fmtMD(p.mx) : fmtMD(p.mn);
+      const half = labelPixelWidth(p.label + " " + dateText) / 2 + 6;
+      let tier = 0;
+      while (tierRight[tier] != null && x - half < tierRight[tier]) tier++;
+      tierRight[tier] = x + half;
+      return { p, x, tier };
+    });
+  }
+  function ganttPoints(pts, range, view, g, m) {
+    const nodes = [];
+    if (!pts.length) return nodes;
+    const a = Math.min(...pts.map(p => xOf(range, p.mn))), b = Math.max(...pts.map(p => xOf(range, p.mx)));
+    nodes.push(el("div", { class: "sg-conn", style: `left:${a}px;width:${b - a}px` }));
+    layoutPoints(pts, range).forEach(({ p, x, tier }) => {
+      const px = xOf(range, p.mn), x2 = xOf(range, p.mx);
+      if (!m && x2 > px) nodes.push(el("div", { class: "sg-span", style: `left:${px}px;width:${x2 - px}px` }));
+      const key = p.custom ? ("custom:" + p.custom.id) : noteKeyFor(view, g, m, p.i);
+      const note = getNote(key);
+      const top = 6 + tier * TIER_H;
+      // 共通線と色を合わせた工程は、予定(plan)状態の時だけ丸もその色にする（遅延・完了・鍵は従来通りの状態色を優先）
+      const catStyle = (p.catColor && (p.st === "plan" || p.st === "fix")) ? `;background:${p.catColor}` : "";
+      const dotEl = el("div", { class: "sg-ms " + p.st + (p.custom ? " custom" : ""), style: `left:${px - 9.5}px;top:${top}px${catStyle}`,
+        title: `${p.label}（${p.mn !== p.mx ? fmtMD(p.mn) + "〜" + fmtMD(p.mx) : fmtMD(p.mn)}）` + (note ? "\nメモ：" + note : "") });
+      if (p.st === "done") dotEl.append(icon("check"));
+      else if (p.st === "late") dotEl.append(icon("exclamation-mark"));
+      else if (p.st === "lock") dotEl.append(icon("lock"));
+      if (note) dotEl.append(el("span", { class: "sg-notemk" }));
+      nodes.push(dotEl);
+      wireDot(dotEl, p, view, g, m);
+      const labelTop = top + 21;
+      nodes.push(el("div", { class: "sg-mslab " + p.st, style: `left:${x}px;top:${labelTop}px` }, p.label,
+        el("span", { class: "sg-dt" }, p.mn !== p.mx ? fmtMD(p.mn) + "〜" + fmtMD(p.mx) : fmtMD(p.mn))));
+    });
+    return nodes;
+  }
+  function scheduleGroupRow(view, cfg, g, range, dayCount) {
+    const tr = el("div", { class: "sg-row" });
+    const fc = familyColorOf(g.children[0]) || "#9aa3b2";
+    const owners = [...new Set(g.children.flatMap(m => (m.owner || "").split("/").filter(Boolean)))].join("/");
+    const anyAI = g.children.some(m => m.listMethod === "AI"), anyKiro = g.children.some(m => m.listMethod !== "AI");
+    const tag = (anyAI && anyKiro) ? el("span", { class: "sg-tag mix" }, "AI+既ロ") : el("span", { class: "sg-tag " + (anyAI ? "ai" : "kiro") }, anyAI ? "AI" : "既ロ");
+    const pri = g.children.map(m => m.priority).find(p => p != null && p !== "");
+    const lblChildren = [el("span", { class: "sg-band", style: `background:${fc}` }),
+      el("span", { class: "sg-nmwrap" },
+        el("span", { class: "sg-nm" }, g.name, el("span", { class: "sg-cnt" }, g.children.length + "本")),
+        el("span", { class: "sg-sub" }, owners + " ", tag))];
+    if (view === "tci" && pri != null && pri !== "") lblChildren.push(el("span", { class: "sg-pri", title: "P3/Listの優先度" }, pri));
+    tr.append(el("div", { class: "sg-lbl", style: `width:${LBL}px` }, ...lblChildren));
+    const rowKey = rowKeyFor(g, null);
+    const track = trackCellsEl(range, dayCount, view, rowKey);
+    const lock = gateLockActive(view, g.name);
+    const pts = [];
+    cfg.steps.forEach((label, i) => {
+      const ds = g.children.map(m => stepDate(view, m, i)).filter(Boolean); if (!ds.length) return;
+      ds.sort();
+      const states = g.children.map(m => stepVisualState(view, m, i, lock)).filter(Boolean);
+      let st;
+      if (states.includes("late")) st = "late";
+      else if (states.every(s => s === "done" || s === "fix")) st = states[0] === "fix" ? "fix" : "done";
+      else if (states.includes("lock")) st = "lock";
+      else st = states.includes("brief") ? "brief" : "plan";
+      const cl = (cfg.commonLines || []).find(x => x.stepIndex === i);
+      // 最終ステップ（入稿/宛名入稿）はcommonLinesに載っていないが、軸(データ入稿日)と同じ日・同じ色として扱う
+      const catColor = cl ? cl.color : (i === cfg.steps.length - 1 ? cfg.axisColor : null);
+      pts.push({ i, label, mn: ds[0], mx: ds[ds.length - 1], st, catColor });
+    });
+    customForRow(view, rowKey).forEach(c => pts.push({ label: c.label, mn: c.date, mx: c.date, st: customVisualState(c), custom: c }));
+    growRowForClusters(tr, pts, range, 54);
+    track.append(...ganttPoints(pts, range, view, g, null));
+    tr.append(track);
+    return tr;
+  }
+  // 近い日・同じ日に工程が複数重なる行は、段の数だけ高さを広げる（重ならないように）
+  function growRowForClusters(tr, pts, range, base) {
+    const layout = layoutPoints(pts, range);
+    const maxTier = layout.reduce((mx, l) => Math.max(mx, l.tier), 0);
+    const extra = maxTier * TIER_H;
+    if (extra > 0) tr.style.height = (base + extra + 14) + "px";
+  }
+  // 縦線（データ入稿日／共通マイルストーン）をドラッグして日付を動かせるようにする。タグをつかんで左右に動かす。
+  // state.moveLinesTogetherがONの時は、掴んだ線だけでなくallLinesに含まれる全ての線を同じ日数ぶん一緒に動かす
+  // （線ごとに現在バラバラな日付でも、それぞれの相対的なズレは保ったまま全体をまとめてスライドできる）
+  function wireMilestoneDrag(tagEl, lineEl, refTrack, getDate, setDate, allLines) {
+    if (!state.editing || !refTrack) { tagEl.style.cursor = "default"; return; }
+    tagEl.style.cursor = "grab";
+    tagEl.addEventListener("mousedown", e => {
+      if (e.button !== 0) return;
+      e.preventDefault(); e.stopPropagation();
+      const together = state.moveLinesTogether && allLines && allLines.length > 1;
+      const targets = together ? allLines : [{ tagEl, lineEl, getDate, setDate }];
+      // ドラッグ開始前の各線の日付をここで確定しておく（1本ずつ確定させると、先に動かした線の新しい日付を
+      // 基準に次の線が計算されてしまい、2重にズレる。全部「開始時点の値＋同じ日数」で計算する）
+      const beforeDates = targets.map(t => t.getDate());
+      const startDate = fallbackDateAtX(refTrack, e.clientX);
+      const bases = targets.map(t => ({ line: parseFloat(t.lineEl.style.left), tag: parseFloat(t.tagEl.style.left) }));
+      let days = 0;
+      targets.forEach(t => t.tagEl.classList.add("drag"));
+      function mv(ev) {
+        days = diffDaysISO(startDate, fallbackDateAtX(refTrack, ev.clientX));
+        targets.forEach((t, idx) => {
+          t.lineEl.style.left = (bases[idx].line + days * CW) + "px";
+          t.tagEl.style.left = (bases[idx].tag + days * CW) + "px";
+        });
+      }
+      function up() {
+        document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
+        targets.forEach(t => t.tagEl.classList.remove("drag"));
+        if (days !== 0) { targets.forEach((t, idx) => t.setDate(addDaysISO(beforeDates[idx], days))); markDirty(); }
+        renderScheduleBoard();
+      }
+      document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+    });
+  }
+  function addOverlayLines(cal, cfg, range, view, refTrack) {
+    // 共通線が増えると、日付が近い時にタグ同士が上端で重なるため、
+    // 実測幅を見て段（tier）に振り分けてから配置する（.sg-mslabの重なり対策と同じ考え方）
+    const specs = [];
+    const axis = state.model[cfg.axisField];
+    if (axis && diffDaysISO(range.from, axis) >= 0) {
+      specs.push({ x: LBL + xOf(range, axis), text: cfg.axisLabel + " " + fmtMD(axis), axis: true, color: cfg.axisColor });
+    }
+    (cfg.commonLines || []).forEach(ml => {
+      const date = ml.stepIndex != null ? stepLineDate(view, ml.stepIndex) : milestoneDate(view, ml);
+      if (!date) return;
+      const text = ml.labelLines ? ml.labelLines[ml.labelLines.length - 1] + " " + fmtMD(date) : `${ml.label} ${fmtMD(date)}`;
+      const widest = ml.labelLines ? Math.max(...ml.labelLines.map((l, i) => tagPixelWidth(i === ml.labelLines.length - 1 ? l + " " + fmtMD(date) : l))) : tagPixelWidth(text);
+      specs.push({ x: LBL + xOf(range, date), text, ml, date, widest });
+    });
+    const tierRight = [];
+    specs.forEach(sp => {
+      const w = (sp.widest != null ? sp.widest : tagPixelWidth(sp.text)) + 12;
+      const half = w / 2 + 4;
+      let tier = 0;
+      while (tierRight[tier] != null && sp.x - half < tierRight[tier]) tier++;
+      tierRight[tier] = sp.x + half;
+      sp.tier = tier;
+    });
+    const maxTier = specs.reduce((mx, s) => Math.max(mx, s.tier), 0);
+    const TAG_TIER_H = 20;
+    cal.style.paddingTop = (54 + maxTier * TAG_TIER_H) + "px";
+    const lineDefs = [];
+    specs.forEach(sp => {
+      const top = 2 + sp.tier * TAG_TIER_H;
+      if (sp.axis) {
+        const line = el("div", { class: "sg-axisline", style: `left:${sp.x}px` + (sp.color ? `;border-left-color:${sp.color}` : "") });
+        const tag = el("div", { class: "sg-axistag", style: `left:${sp.x}px;top:${top}px` + (sp.color ? `;background:${sp.color}` : "") }, sp.text);
+        cal.append(line, tag);
+        lineDefs.push({ tagEl: tag, lineEl: line, getDate: () => state.model[cfg.axisField], setDate: d => { state.model[cfg.axisField] = d; } });
+        return;
+      }
+      const ml = sp.ml;
+      const line = el("div", { class: "sg-axisline", style: `left:${sp.x}px;border-left-color:${ml.color}` });
+      const tag = el("div", { class: "sg-axistag" + (ml.labelLines ? " multi" : ""), style: `left:${sp.x}px;top:${top}px;background:${ml.color}` });
+      if (ml.labelLines) {
+        ml.labelLines.forEach((line2, i) => {
+          if (i > 0) tag.append(el("br", {}));
+          tag.append(document.createTextNode(i === ml.labelLines.length - 1 ? `${line2} ${fmtMD(sp.date)}` : line2));
+        });
+      } else {
+        tag.append(document.createTextNode(sp.text));
+      }
+      cal.append(line, tag);
+      const getDate = ml.stepIndex != null ? (() => stepLineDate(view, ml.stepIndex)) : (() => milestoneDate(view, ml));
+      const setDate = ml.stepIndex != null ? (d => setStepLineDate(view, ml.stepIndex, d)) : (d => setMilestoneDate(view, ml, d));
+      lineDefs.push({ tagEl: tag, lineEl: line, getDate, setDate });
+    });
+    lineDefs.forEach(ld => wireMilestoneDrag(ld.tagEl, ld.lineEl, refTrack, ld.getDate, ld.setDate, lineDefs));
+    const t = todayISO(), tx = LBL + xOf(range, t);
+    cal.append(el("div", { class: "sg-todayline", style: `left:${tx - 1.5}px` }));
+    cal.append(el("div", { class: "sg-todaytag", style: `left:${tx}px` }, "今日"));
+  }
+  // 企画連携ゲート（デザインスケジュール側のみ。リストスケジュール側の「依頼書格納」の鍵は廃止した）
+  function openGatePopover(view, g, anchor) {
+    closeColMenu();
+    const cfg = SCHED[view];
+    const arr = groupGate(g.name);
+    const pop = el("div", { class: "sg-gatepop", id: "colMenu" });
+    pop.addEventListener("click", e => e.stopPropagation());
+    const allOkBtn = el("button", { class: "sg-gatepop-b", title: "この5項目すべてをOKにする" }, "全てOK");
+    allOkBtn.addEventListener("click", () => {
+      for (let i = 0; i < arr.length; i++) arr[i] = "ok";
+      syncGateDone(view, g);
+      markDirty(); closeColMenu(); renderScheduleBoard();
+    });
+    pop.append(el("div", { class: "sg-gatepop-h" }, el("span", {}, g.name + " 企画連携チェック"), allOkBtn));
+    cfg.gateItems.forEach((item, idx) => {
+      const rowEl = el("div", { class: "sg-gatepop-row" }, el("span", { class: "sg-gatepop-t" }, item));
+      const mk = (val, label) => {
+        const on = arr[idx] === val;
+        const b = el("button", { class: "sg-gatepop-b" + (on ? " on" : "") }, label);
+        b.addEventListener("click", () => {
+          arr[idx] = (arr[idx] === val) ? "" : val;
+          syncGateDone(view, g);
+          markDirty(); closeColMenu(); renderScheduleBoard();
+        });
+        return b;
+      };
+      rowEl.append(mk("ok", "OK"), mk("na", "不要"));
+      pop.append(rowEl);
+    });
+    const r = anchor.getBoundingClientRect();
+    pop.style.left = Math.min(r.left, window.innerWidth - 260) + "px"; pop.style.top = (r.bottom + 6) + "px";
+    document.body.append(pop);
+    setTimeout(() => document.addEventListener("click", closeColMenu), 0);
+  }
+  function renderScheduleBoard() {
+    const root = $("#schedBoard"); if (!root) return; root.innerHTML = "";
+    if (!state.model) { root.append(el("div", { class: "placeholder" }, "「対象月」で月を選んでください。")); return; }
+    computeFamilyColors();
+    const view = state.tab; const cfg = SCHED[view];
+    const groups = scheduleGroups();
+
+    // 各共通線はドラッグで日付変更できるため日付欄の羅列は廃止したが、基準となる入稿日（データ入稿日／宛名入稿日）だけは
+    // 新しい月で空の時に入力する場所が必要なため、常にここへ置く
+    const controls = el("div", { class: "sg-controls" });
+    const axisInp = el("input", { type: "date", class: "sg-axis-input", value: state.model[cfg.axisField] || "", title: cfg.axisLabel + "を入れると、そこから逆算してスケジュールが組まれます" });
+    axisInp.addEventListener("change", () => {
+      if (!state.editing) { axisInp.value = state.model[cfg.axisField] || ""; blockEdit(); return; }
+      state.model[cfg.axisField] = axisInp.value; markDirty(); renderScheduleBoard();
+    });
+    controls.append(el("label", { class: "sg-axis-field" }, cfg.axisLabel, axisInp));
+    const pastBtn = el("button", { class: "btn small ghost", title: "今日より前の日付で、まだ完了になっていない工程をまとめて完了（☑）にします" }, "☑ 今日より前を完了に");
+    pastBtn.addEventListener("click", markAllPastDone);
+    controls.append(pastBtn);
+    if ((cfg.commonLines || []).length) {
+      const togetherBtn = el("button", { class: "btn small toggle" + (state.moveLinesTogether ? " on" : ""), title: "ONの間は、縦線（データ入稿日・各共通線）をどれか1本ドラッグすると、他の線も同じ日数ぶん一緒に動きます（線ごとの日付のズレはそのまま保たれます）" },
+        icon(state.moveLinesTogether ? "link" : "link-off"), " まとめて動かす");
+      togetherBtn.addEventListener("click", () => { state.moveLinesTogether = !state.moveLinesTogether; renderScheduleBoard(); });
+      controls.append(togetherBtn);
+    }
+    root.append(controls);
+
+    if (!groups.length) { root.append(el("div", { class: "placeholder" }, "「施策一覧」タブで施策名を入力すると、ここにスケジュールが表示されます。")); return; }
+    if (!state.model[cfg.axisField]) { root.append(el("div", { class: "placeholder" }, cfg.axisLabel + "を入力すると、ここに逆算スケジュールが表示されます。")); return; }
+    const range = scheduleRange(view);
+
+    const sec = el("section", { class: "sg-sec" });
+    const legend = el("div", { class: "sg-legend" });
+    if (view === "design") {
+      legend.append(el("span", {}, el("span", { class: "sg-dot", style: "background:#9aa3b2" }), "企画連携チェック未完了"));
+    }
+    legend.append(
+      el("span", {}, el("span", { class: "sg-dot", style: "background:#3fae62" }), "完了"),
+      el("span", {}, el("span", { class: "sg-dot", style: "background:#e5484d" }), "遅延"),
+      el("span", {}, el("span", { class: "sg-dot", style: "background:#a78bfa" }), "予定"),
+      el("span", {}, el("span", { class: "sg-vl", style: "background:" + (cfg.axisColor || "#2563eb") }), cfg.axisLabel + "（全施策共通）"),
+      el("span", {}, el("span", { class: "sg-vl", style: "background:#e0761a" }), "今日"));
+    sec.append(legend);
+
+    const dayCount = diffDaysISO(range.from, range.to) + 1;
+    const hasMultiTag = (cfg.commonLines || []).some(ml => ml.labelLines);
+    const cal = el("div", { class: "sg-cal" + (hasMultiTag ? " has-multi-tags" : "") });
+    cal.append(scheduleHeaderEl(range, dayCount));
+    const body = el("div", { class: "sg-body" });
+    let refTrack = null;
+    groups.forEach(g => {
+      const row = scheduleGroupRow(view, cfg, g, range, dayCount);
+      body.append(row);
+      if (!refTrack) refTrack = row.querySelector(".sg-track");
+    });
+    cal.append(body);
+    addOverlayLines(cal, cfg, range, view, refTrack);
+    const scrollBox = el("div", { class: "sg-scroll" }, cal);
+    sec.append(scrollBox);
+    // 横スクロール用のスライドバー（ネイティブのスクロールバーが掴みにくいための代替操作）
+    const slider = el("input", { type: "range", class: "sg-hslider", min: "0", max: "1000", value: "0" });
+    slider.addEventListener("input", () => {
+      const maxScroll = Math.max(0, scrollBox.scrollWidth - scrollBox.clientWidth);
+      scrollBox.scrollLeft = (Number(slider.value) / 1000) * maxScroll;
+    });
+    scrollBox.addEventListener("scroll", () => {
+      const maxScroll = Math.max(1, scrollBox.scrollWidth - scrollBox.clientWidth);
+      slider.value = String(Math.round((scrollBox.scrollLeft / maxScroll) * 1000));
+    });
+    sec.append(el("div", { class: "sg-hslider-wrap" }, slider));
+    sec.append(el("div", { class: "sg-hint" }, view === "design"
+      ? "いちばん左が「企画連携」。グレーの錠マークをクリックすると5項目のチェックが出ます。OKまたは不要がすべて選ばれると錠が外れて連携完了にできます。入稿日はタナカの締切なので全施策共通（青の縦線）。"
+      : "AI施策はGV社への提供があるぶん早め、既存ロジックはGV工程なし（GV共有・スコアリングを省略）で遅めに自動設定されます。宛名入稿はTCIの締切なので全施策共通（青の縦線）。丸は右クリックでメモの追加や工程の追加ができます。"));
+    root.append(sec);
+    root.append(renderTodoSection(view, cfg, groups));
+  }
+  // 遅延（⚠）と、今日から1週間以内に来る工程を、上のガントと連動するTODOリストとして表示する
+  function scheduleTodoItems(view, cfg, groups) {
+    const today = todayISO();
+    const items = [];
+    groups.forEach(g => {
+      const lock = gateLockActive(view, g.name);
+      cfg.steps.forEach((label, i) => {
+        if (i === cfg.steps.length - 1) return;   // 入稿/宛名入稿(=軸そのもの)は対象外
+        const ds = g.children.map(m => stepDate(view, m, i)).filter(Boolean);
+        if (!ds.length) return;
+        const states = g.children.map(m => stepVisualState(view, m, i, lock)).filter(Boolean);
+        if (!states.length || states.includes("lock")) return;   // ゲート未解決は対象外（チェックしても完了にできないため）
+        if (states.every(s => s === "done" || s === "fix")) return;   // 既に完了
+        ds.sort();
+        const date = ds[0];
+        const diff = diffDaysISO(date, today);
+        const bucket = diff > 0 ? "late" : (diff >= -7 ? "soon" : null);
+        if (bucket) items.push({ view, group: g, stepIndex: i, label, date, bucket });
+      });
+      customForRow(view, rowKeyFor(g, null)).forEach(c => {
+        if (c.done) return;
+        const diff = diffDaysISO(c.date, today);
+        const bucket = diff > 0 ? "late" : (diff >= -7 ? "soon" : null);
+        if (bucket) items.push({ view, group: g, custom: c, label: c.label, date: c.date, bucket });
+      });
+    });
+    items.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : 0);
+    return items;
+  }
+  function completeTodoItem(item) {
+    if (!state.editing) { blockEdit(); return; }
+    if (item.custom) item.custom.done = true;
+    else item.group.children.forEach(m => { if (stepDate(item.view, m, item.stepIndex)) setStepDone(item.view, m, item.stepIndex, true); });
+    markDirty(); renderScheduleBoard();
+  }
+  function renderTodoSection(view, cfg, groups) {
+    const items = scheduleTodoItems(view, cfg, groups);
+    const sec = el("section", { class: "sg-todo-sec" });
+    sec.append(el("div", { class: "sg-todo-head" }, "TODO：遅延・1週間以内の工程", el("span", { class: "sg-todo-count" }, items.length + "件")));
+    if (!items.length) { sec.append(el("div", { class: "sg-todo-empty" }, "遅延・直近1週間の工程はありません。")); return sec; }
+    const list = el("div", { class: "sg-todo-list" });
+    items.forEach(item => {
+      const chk = el("input", { type: "checkbox" });
+      chk.addEventListener("change", () => completeTodoItem(item));
+      const badge = el("span", { class: "sg-todo-badge " + item.bucket }, item.bucket === "late" ? "遅延" : "期限間近");
+      list.append(el("div", { class: "sg-todo-item " + item.bucket }, chk, badge,
+        el("span", { class: "sg-todo-name" }, item.group.name + " ー " + item.label),
+        el("span", { class: "sg-todo-date" }, fmtMD(item.date))));
+    });
+    sec.append(list);
+    return sec;
+  }
+  function renderKickoffCard() {
+    const box = $("#kickoffCard"); if (!box) return; box.innerHTML = "";
+    if (!state.model) return;
+    const k = kickoffObj();
+    const done = gateArrDone(k.items);
+    let badge;
+    if (done) badge = el("span", { class: "sg-kickoff-badge done" }, "回答済");
+    else if (!k.due) badge = el("span", { class: "sg-kickoff-badge wait" }, "期限未設定");
+    else {
+      const d = diffDaysISO(k.due, todayISO());
+      badge = d > 0 ? el("span", { class: "sg-kickoff-badge over" }, "期限超過")
+        : el("span", { class: "sg-kickoff-badge " + (-d <= 2 ? "soon" : "wait") }, `あと${-d}日`);
+    }
+    const chev = el("button", { class: "sg-chev" }, icon(k.open ? "chevron-down" : "chevron-right"));
+    chev.addEventListener("click", () => { k.open = !k.open; renderKickoffCard(); });
+    const head = el("div", { class: "sg-kickoff-h" }, chev, icon("mail"), el("span", { class: "sg-kickoff-t" }, "栗田さん（TCI）からの月次キックオフ依頼"));
+    if (k.open) {
+      const dueInp = el("input", { type: "date", value: k.due || "" });
+      dueInp.addEventListener("change", () => { if (!state.editing) { dueInp.value = k.due || ""; blockEdit(); return; } k.due = dueInp.value; markDirty(); renderKickoffCard(); });
+      head.append(el("span", { class: "sg-kickoff-who" }, "回答期限 ", dueInp));
+    }
+    head.append(el("span", { class: "sg-spacer" }), badge);
+    box.append(head);
+    if (k.open) {
+      const list = el("div", { class: "sg-kickoff-list" });
+      KICKOFF_ITEMS.forEach((item, idx) => {
+        const rowEl = el("div", { class: "sg-kickoff-row" }, el("span", { class: "sg-kickoff-t2" }, (idx + 1) + ". " + item));
+        const mk = (val, label) => {
+          const on = k.items[idx] === val;
+          const b = el("button", { class: "sg-kickoff-b" + (on ? " on" : "") }, label);
+          b.addEventListener("click", () => {
+            if (!state.editing) { blockEdit(); return; }
+            k.items[idx] = (k.items[idx] === val) ? "" : val;
+            if (idx === 0) listGateArr()[0] = k.items[0];
+            markDirty(); renderKickoffCard(); if (state.tab === "tci") renderScheduleBoard();
+          });
+          return b;
+        };
+        rowEl.append(mk("ok", "OK"), mk("na", "不要"));
+        list.append(rowEl);
+      });
+      box.append(list, el("div", { class: "sg-kickoff-foot" }, "企画サマリーにまだ施策が入っていない月でも、ここから始まります。①の回答は「リスト抽出準備」チェックの「DM企画決定」と同じ事実です。"));
+    }
+  }
+  function switchTab(tab) {
+    state.tab = tab;
+    document.querySelectorAll(".sg-tab").forEach(b => b.classList.toggle("on", b.dataset.tab === tab));
+    $("#summary").style.display = tab === "list" ? "" : "none";
+    $("#board").style.display = tab === "list" ? "" : "none";
+    $("#schedBoard").style.display = tab === "list" ? "none" : "";
+    if (tab === "list") renderBody(); else renderScheduleBoard();
+  }
+
+  // ============ 行操作 ============
+  function move(key, id, d) { if (!state.editing) return; const l = state.model[key]; const i = l.findIndex(x=>x.id===id), j=i+d; if(i<0||j<0||j>=l.length)return; [l[i],l[j]]=[l[j],l[i]]; markDirty(); rerender(); }
+  function del(key, id) { if (!state.editing) return; const l = state.model[key]; const i = l.findIndex(x=>x.id===id); if(i>=0){l.splice(i,1);state.selected.delete(id);markDirty();rerender();} }
+  function sortByPriority() {
+    if (!state.editing) { blockEdit(); return; }
+    // 施策名グループの先頭行（太字の行）だけを対象にする。2行目以降は優先度を出さない
+    let prevBase = null;
+    const tops = [];
+    state.model.active.forEach(m => {
+      const bn = (m.baseName || "").trim();
+      const isTop = !(bn && bn === prevBase);
+      prevBase = bn;
+      if (isTop) tops.push(m); else m.priority = "";
+    });
+    // 先頭行の中でも、P3/Listが入っている施策だけ優先度を振る（入っていない施策は空のまま）
+    const scored = tops.filter(m => (parseFloat(m.p3) || 0) > 0);
+    tops.filter(m => !((parseFloat(m.p3) || 0) > 0)).forEach(m => m.priority = "");
+    // AI/既ロは区別せず、P3/Listが高い順に優先度1から
+    scored.sort((x, y) => (parseFloat(y.p3) || 0) - (parseFloat(x.p3) || 0));
+    scored.forEach((m, i) => m.priority = i + 1);
+    markDirty(); rerender(); flash("P3/Listがある施策の先頭行に、優先度を振りました");
+  }
+  // 案件共有シートへの一括貼り付け用：表示中の順で1行1施策のテキストをコピー（Excelへ縦一列で貼り付け可）
+  function copyToClipboardLines(values, label) {
+    if (!navigator.clipboard) return;
+    const text = values.join("\n");
+    navigator.clipboard.writeText(text).then(() => flash(`${label}を${values.length}件コピーしました（案件共有シートへ貼り付けできます）`)).catch(() => {});
+  }
+  // 一括コピーは画面の表示順（中止済みは除外・実施中だけを最新の並びで）に揃える。
+  // 中止・振替した施策まで含めると、案件共有シートに実施していない施策名が混ざってしまうため。
+  function liveSortedRows(key) { return orderedRows(key).live; }
+  function copyAllOfficialNames() {
+    const rows = liveSortedRows("active");
+    copyToClipboardLines(rows.map(m => derive(m, state.month).fullName), "正式名");
+  }
+  function copyAllCounts() {
+    const rows = liveSortedRows("active");
+    copyToClipboardLines(rows.map(m => m.estimatedCount || ""), "想定件数");
+  }
+  function copyAllOwners() {
+    const rows = liveSortedRows("active");
+    copyToClipboardLines(rows.map(m => m.owner || ""), "担当");
+  }
+
+  // ============ フィールド入力（再描画せず） ============
+  function onInput(e) {
+    const t = e.target, id = t.getAttribute("data-id"), f = t.getAttribute("data-field");
+    if (!id || !f || !state.model) return;
+    let item = null;
+    for (const k of ["active","carryNext","carryFuture","ideas"]) { item = state.model[k].find(x=>x.id===id); if(item)break; }
+    if (!item) return;
+    // 複数選択中に「種別・取得」を変えたら、選択中の行すべてに同じ値を一括反映する
+    if (["kind", "listMethod"].includes(f) && state.selected.size > 1 && state.selected.has(id)) {
+      const val = t.value, n = state.selected.size;
+      ["active", "carryNext", "carryFuture"].forEach(k => state.model[k].forEach(x => { if (state.selected.has(x.id)) x[f] = val; }));
+      rerender(); flash(`選択中の${n}件をまとめて変更しました`);
+      return;
+    }
+    item[f] = t.value;
+    if (f === "kind") { rerenderRow(sectionOf(item), item); refreshAllNames(); renderSummary(); return; }
+    if (f === "category") { const cc = document.querySelector(`[data-code="${id}"]`); if (cc) renderCodeCell(cc, item); }
+    if (f === "num") { const cv = document.querySelector(`[data-code="${id}"] .codeval`); if (cv) cv.textContent = window.buildMaterialCode(window.prefixOfCategory(item.category), item.num) || "—"; }
+    if (f === "baseName") { refreshAllNames(); applyFamilyColors(); }   // 採番＋色を即時更新
+    else if (["category", "num", "media", "codeStatus"].includes(f)) { const nin = document.querySelector(`[data-derived="${id}"] .namein`); if (nin && !(item.officialName && item.officialName.trim())) nin.value = derive(item, state.month).fullName; }
+    if (f === "estimatedCount") renderSummary();
+  }
+
+  function findMeasure(id){ for(const k of ["active","carryNext","carryFuture"]){const m=state.model[k].find(x=>x.id===id);if(m)return m;} return null; }
+  function sectionOf(m){ for(const k of ["active","carryNext","carryFuture"]) if(state.model[k].includes(m)) return k; return "active"; }
+  // 複数選択中にトグル系の操作をしたら、選択中の行すべてへ同じ値を反映する（1件だけならその行だけ）
+  function applyToSelection(m, field, value) {
+    const ids = (state.selected.size > 1 && state.selected.has(m.id)) ? [...state.selected] : [m.id];
+    ids.forEach(id => { const row = findMeasure(id); if (row) row[field] = value; });
+    return ids.length;
+  }
+  function labeled(label, node){ return el("div", { class: "dw-field" }, el("div", { class: "dw-lab" }, label), node); }
+
+  // ============ 月の読み書き ============
+  async function loadMonth(month) {
+    if (!month) return;
+    // 自動保存をやめたため、未保存のまま月を切り替えると編集内容が消える。切り替える前に保存するか確認する
+    if (state.editing && hasUnsaved()) {
+      const ok = confirm("保存していない変更があります。\n\n「OK」＝保存してから切り替える\n「キャンセル」＝保存せずに切り替える（変更は失われます）");
+      if (ok) { await saveNow(false); if (state.saveError) { const s0 = $("#monthSelect"); if (s0) s0.value = state.month; return; } }
+      else { state.dirty = false; Object.keys(state.crossMonth).forEach(mo => { if (state.crossMonth[mo]) state.crossMonth[mo].dirty = false; }); }
+    }
+    const sel = $("#monthSelect"); if (sel) sel.disabled = true;   // 読み込み中は触れないように（共有フォルダ読み取り待ち）
+    state.crossMonth = {}; state.crossSelected.clear(); state.crossExpanded = {};
+    state.month = month; state.selected.clear();
+    // 内容と更新日時を同時に読みに行く（順番に読むより速い）
+    const [raw, mtime] = await Promise.all([S.readMonth(month), S.monthMtime(month)]);
+    state.model = normalize(raw || emptyModel(month));
+    state.model.title = window.monthLabel(month) + " DM施策";   // タイトルは対象月から自動
+    state.baseline = JSON.parse(JSON.stringify(state.model));   // 保存時3-way mergeの基準点
+    state.mtime = mtime; state.editing = false;
+    resetUndo();   // 月をまたいで前の月の内容に戻してしまわないよう、履歴は月ごとに作り直す
+    rerender(); startPolling();
+    if (sel) sel.disabled = false;
+    await enableEditing();
+  }
+  // 閲覧/編集モードは廃止。共有フォルダに接続・月を開いていて・お名前が入っていれば自動で編集可能にする
+  // （ロックは他の人が同時編集中かもという情報表示だけに使い、ブロックはしない）
+  async function enableEditing() {
+    if (state.editing || !S.isConnected() || !state.model || !state.user) return;
+    const lock = await S.readLock(state.month);
+    if (lock && lock.user !== state.user) flash(`${lock.user} さんも編集中の可能性があります。保存内容にご注意ください。`);
+    // ロックは情報表示のみが目的で、書き込みの成否は編集可否に影響させない。
+    // 同時接続が多いと共有フォルダ上の同じlock.jsonへの書き込みが競合して失敗することがあり、
+    // ここでawaitに失敗すると以降のstate.editing=trueが実行されず「編集できない」状態が固定化してしまうため必ず捕捉する。
+    try { await S.writeLock(state.month, { user: state.user, ts: Date.now() }); } catch (e) {}
+    state.editing = true; rerender();
+  }
+  // ===== 元に戻す（Ctrl+Z）=====
+  // 1文字ごとではなく「手が止まるまでの一連の編集」を1回分として覚える。
+  // lastQuiet＝直前に手が止まった時点の内容。新しい編集が始まった瞬間に、それを戻り先として積む。
+  const UNDO_MAX = 30;
+  let undoStack = [], redoStack = [], lastQuiet = null, burstActive = false, quietTimer = null;
+  function snapshotModel() { return state.model ? JSON.parse(JSON.stringify(state.model)) : null; }
+  function resetUndo() { undoStack = []; redoStack = []; burstActive = false; clearTimeout(quietTimer); lastQuiet = snapshotModel(); updateUndoBtn(); }
+  function noteEditForUndo() {
+    if (!state.model) return;
+    if (!burstActive) {
+      if (lastQuiet) { undoStack.push(lastQuiet); if (undoStack.length > UNDO_MAX) undoStack.shift(); redoStack = []; }
+      burstActive = true;
+    }
+    clearTimeout(quietTimer);
+    quietTimer = setTimeout(() => { lastQuiet = snapshotModel(); burstActive = false; }, 600);
+  }
+  function applySnapshot(snap) {
+    syncObjectInPlace(state.model, snap);   // 入力欄が掴んでいる行オブジェクトを生かしたまま中身を戻す
+    clearTimeout(quietTimer); burstActive = false; lastQuiet = snapshotModel();
+    state.dirty = true; dirtySeq++;
+    rerender(); updateUndoBtn();
+  }
+  function undoEdit() {
+    if (!state.editing || !state.model) { blockEdit(); return; }
+    if (!undoStack.length) { flash("これ以上は戻せません"); return; }
+    redoStack.push(snapshotModel());
+    applySnapshot(undoStack.pop());
+    flash("元に戻しました（やり直しは Ctrl+Y）");
+  }
+  function redoEdit() {
+    if (!state.editing || !state.model || !redoStack.length) return;
+    undoStack.push(snapshotModel());
+    applySnapshot(redoStack.pop());
+    flash("やり直しました");
+  }
+  function updateUndoBtn() {
+    const b = $("#undoBtn"); if (!b) return;
+    b.classList.toggle("hidden", !(state.editing && state.model && undoStack.length > 0));
+  }
+  // ===== 保存 =====
+  // dirtySeq＝編集のたびに進むカウンタ。共有フォルダへの書き込み待ちの間に打った文字まで
+  // 「保存済み」にしてしまうと、その入力が保存されないまま消えてしまうため、保存前後で見比べる
+  let dirtySeq = 0;
+  // 入力の途中で勝手に保存すると、打っている最中の文字が取りこぼされることがあるため自動保存はやめ、
+  // 「保存」ボタン（またはCtrl+S）を押した時だけ共有フォルダへ書き込む
+  function markDirty() { if (!state.editing) return; noteEditForUndo(); state.dirty = true; dirtySeq++; updateSaveBtn(); updateUndoBtn(); }
+  function hasUnsaved() {
+    if (state.dirty) return true;
+    return Object.keys(state.crossMonth).some(mo => { const e = state.crossMonth[mo]; return e && e.dirty; });
+  }
+  function updateSaveBtn() {
+    const b = $("#saveBtn"), lab = $("#saveBtnLabel"); if (!b || !lab) return;
+    const can = state.editing && state.model && S.isConnected();
+    b.classList.toggle("hidden", !can);
+    if (!can) return;
+    if (saving) { b.className = "save-btn saving"; lab.textContent = "保存中…"; b.disabled = true; return; }
+    b.disabled = false;
+    if (state.saveError) { b.className = "save-btn err"; lab.textContent = "保存できません（押して再試行）"; return; }
+    if (hasUnsaved()) { b.className = "save-btn dirty"; lab.textContent = "保存（未保存の変更あり）"; return; }
+    b.className = "save-btn"; lab.textContent = "保存済み";
+  }
+  // 保存ボタン／Ctrl+S から呼ぶ。今月ぶんと、過去月比較で触った月もまとめて保存する
+  async function saveNow(fromButton) {
+    if (!state.editing || !state.model || !S.isConnected()) { blockEdit(); return; }
+    await doAutoSave(true);
+    const months = Object.keys(state.crossMonth).filter(mo => { const e = state.crossMonth[mo]; return e && e.dirty; });
+    for (const mo of months) await doCrossSave(mo);
+    updateSaveBtn();
+    if (fromButton && !state.saveError) flash("保存しました");
+  }
+  async function doAutoSave(force) {
+    clearTimeout(autoTimer);
+    if (!state.editing || !state.model || !S.isConnected()) return;
+    if (!force && !state.dirty) return;
+    saving = true; updateSavedAt();
+    const stamp = new Date().toISOString();
+    const seq = dirtySeq;
+    try {
+      state.model.updatedAt = stamp; state.model.updatedBy = state.user;   // 書き込み成功時のみ有効な値
+      // 保存直前に共有フォルダの最新版を読み直し、同時アクセス中の他の人の更新（違う場所の編集）を潰さないよう3-way mergeする
+      let diskRaw = null;
+      try { diskRaw = await S.readMonth(state.month); } catch (e) {}
+      const disk = diskRaw ? normalize(diskRaw) : state.model;
+      const merged = mergeModels(state.baseline || state.model, state.model, disk);
+      // 自分の変更だけなら（他の人の更新が混ざっていないなら）画面は再描画しない＝入力中の再描画でカーソルが飛ぶのを防ぐ
+      const importedOthers = JSON.stringify(merged) !== JSON.stringify(state.model);
+      // これから実際に書き込む内容を固定する。mergedは編集中の行オブジェクトを参照しているため、
+      // 書き込み待ちの間に打った文字が入る場合と入らない場合があり、そのままbaselineにすると
+      // 「保存されていないのに保存済みの基準」になって次回のmergeで共有フォルダ側の古い値に戻されてしまう。
+      const payload = JSON.parse(JSON.stringify(merged));
+      await S.writeMonth(state.month, payload);
+      syncObjectInPlace(state.model, merged);   // 入力欄が掴んでいる行オブジェクトを生かしたまま中身を反映（入れ替えると入力値が失われる）
+      state.mtime = await S.monthMtime(state.month);
+      state.baseline = payload;                 // 基準点＝実際に書き込んだ内容
+      saving = false; state.saveError = ""; updateSavedAt();
+      clearTimeout(retryTimer);
+      // 書き込み待ちの間にも入力があったなら、未保存のまま残す（次に保存ボタンを押した時に書き込まれる）
+      state.dirty = (dirtySeq !== seq);
+      updateSaveBtn();
+      if (importedOthers) autoRefresh("full");   // 他の人の更新が混ざった時だけ画面に反映（入力中なら入力が終わるまで待つ）
+    } catch (e) {
+      // 書き込み失敗：保存済み扱いにしない。理由を画面に出す。
+      saving = false; state.saveError = (e && e.message) ? e.message : String(e); updateSavedAt(); updateSaveBtn();
+      console.error("[save] 保存に失敗:", e);
+      if (force) alert("保存に失敗しました：" + state.saveError + "\n\nもう一度「保存」を押してください。");
+    }
+  }
+  // ---- モーダル ----
+  function closeModal() { const s = document.getElementById("modalScrim"); if (s) s.remove(); }
+  function openModal(title, bodyNode) {
+    closeModal();
+    const scrim = el("div", { class: "modal-scrim", id: "modalScrim" });
+    const box = el("div", { class: "modal" });
+    box.append(el("div", { class: "modal-head" }, el("div", { class: "modal-title" }, title), el("button", { class: "iconbtn", onclick: closeModal }, "✕")));
+    box.append(el("div", { class: "modal-body" }, bodyNode));
+    scrim.append(box);
+    scrim.addEventListener("click", e => { if (e.target === scrim) closeModal(); });
+    document.body.append(scrim);
+  }
+  async function newMonth() {
+    if (!S.isConnected()) { alert("共有フォルダに未接続です。右上「共有フォルダに接続」で共有フォルダを選んでから作成してください。"); return; }
+    const months = await S.listMonths();
+    const body = el("div", {});
+    const monthInp = el("input", { class: "modal-in", placeholder: "例：202611", maxlength: "6", inputmode: "numeric" });
+    body.append(labeled("発送年月（6桁）", monthInp));
+    const srcSel = el("select", { class: "modal-in" });
+    srcSel.append(el("option", { value: "" }, "空で作成（コピーしない）"));
+    months.forEach(mo => srcSel.append(el("option", { value: mo }, `${window.monthLabel(mo)} をコピー`)));
+    if (months.length) srcSel.value = months[0];   // 既定＝最新月
+    body.append(labeled("コピー元の月（素材コードは未確定に戻ります）", srcSel));
+    const err = el("div", { class: "modal-err" });
+    const create = async () => {
+      const m = monthInp.value.trim(); err.textContent = "";
+      if (!window.isValidMonth(m)) { err.textContent = "6桁の数字で入力してください（例：202611）"; return; }
+      if (await S.readMonth(m)) { err.textContent = "その月は既にあります。上部の「対象月」から開いてください。"; return; }
+      let model = emptyModel(m);
+      const src = srcSel.value;
+      if (src) {
+        const s = await S.readMonth(src);
+        if (s) {
+          model = normalize(JSON.parse(JSON.stringify(s)));
+          model.month = m; model.title = window.monthLabel(m) + " DM施策"; model.updatedAt = ""; model.updatedBy = ""; model.mailDate = "";
+          model.designAxis = ""; model.tciAxis = ""; model.schedule = emptySchedule();
+          ["active","carryNext","carryFuture"].forEach(k => (model[k]||[]).forEach(it => { it.id = uid(); it.codeStatus = "未確定"; it.num = ""; it.officialName = ""; it.printerNote = ""; }));
+          (model.ideas||[]).forEach(it => it.id = uid());
+        }
+      }
+      await S.writeMonth(m, model); closeModal(); await renderMonthSelect(); $("#monthSelect").value = m; await loadMonth(m); flash("新規月を作成しました");
+    };
+    monthInp.addEventListener("keydown", e => { if (e.key === "Enter") create(); });
+    body.append(err, el("div", { class: "modal-actions" }, el("button", { class: "btn primary", onclick: create }, "作成")));
+    openModal("新規月を作成", body);
+    setTimeout(() => monthInp.focus(), 0);
+  }
+
+  // ============ 見積もり依頼（Excel出力） ============
+  function openEstimateModal() {
+    if (!state.model) { alert("対象月を選んでください。"); return; }
+    const mailDate = state.model.mailDate;
+    const rows = sortView(state.model.active.filter(passFilters)).filter(m => m.baseName && m.baseName.trim() && !m.cancelled);
+    const body = el("div", {});
+    if (!mailDate) {
+      body.append(el("div", { class: "modal-err" }, "先にヘッダーの「投函日」を入力してください（編集モードにして入力します）。"));
+    } else {
+      body.append(labeled("投函日", el("div", {}, mailDate)));
+    }
+    body.append(labeled("出力対象", `${rows.length}件の施策（現在の表示順・絞り込みに従います）`));
+    if (rows.length > window.Estimate.MAX_ROWS) {
+      body.append(el("div", { class: "modal-err" }, `テンプレートは最大${window.Estimate.MAX_ROWS}件までです。絞り込みで件数を減らしてください。`));
+    }
+    const folderRow = el("div", { class: "modal-row" });
+    const refreshFolderRow = () => {
+      folderRow.innerHTML = "";
+      folderRow.append(el("span", {}, S.estIsConnected() ? ("接続中：" + S.estFolderName()) : "未接続"));
+      if (!S.estIsConnected()) {
+        folderRow.append(el("button", { class: "btn small", onclick: async () => {
+          try { await S.estConnectFolder(); refreshFolderRow(); } catch (e) { alert(e.message); }
+        } }, "📁 保存先フォルダに接続"));
+      } else {
+        folderRow.append(el("button", { class: "btn small ghost", onclick: async () => {
+          try { await S.estChangeFolder(); refreshFolderRow(); } catch (e) { alert(e.message); }
+        } }, "📁 フォルダを変更"));
+      }
+    };
+    refreshFolderRow();
+    body.append(labeled("見積もり依頼の保存先（「01.DM」または「◯年度」フォルダを選択。年度・月のフォルダが無ければ自動作成、既にある場合は入れ子で作らずそこに保存します）", folderRow));
+    const err = el("div", { class: "modal-err" });
+    const genBtn = el("button", { class: "btn primary", onclick: async () => {
+      if (!mailDate) { alert("投函日を入力してください。"); return; }
+      if (!rows.length) { alert("出力対象の施策がありません。"); return; }
+      if (rows.length > window.Estimate.MAX_ROWS) { alert(`最大${window.Estimate.MAX_ROWS}件までです。`); return; }
+      if (!S.estIsConnected()) { alert("保存先フォルダに接続してください。"); return; }
+      genBtn.disabled = true; err.textContent = "";
+      try {
+        const rowsData = rows.map(m => ({
+          name: derive(m, state.month).fullName,
+          count: parseInt(m.estimatedCount, 10) || "",
+          spec: m.spec || "Z圧着",
+          pctPostal: (parseFloat(m.delivery) || 0) / 100,
+          note: m.printerNote || "",
+        }));
+        const outBuf = await window.Estimate.build({ mailDate, rows: rowsData });
+        const [yearFolder, monthFolder] = window.Estimate.subfolderName(mailDate);
+        // 接続先が既に「年度」フォルダ（または「月見積」フォルダ）そのものの場合は、
+        // 同名フォルダを入れ子で作らないようにその階層を省く
+        const connectedName = S.estFolderName();
+        let names = [yearFolder, monthFolder];
+        if (connectedName === monthFolder) names = [];
+        else if (connectedName === yearFolder) names = [monthFolder];
+        const dir = await S.estGetSubfolder(names);
+        const fname = window.Estimate.filename(mailDate);
+        await S.estWriteFile(dir, fname, outBuf);
+        // 保存に加えて、同じ内容をブラウザのダウンロードにも渡す（クリックでそのままExcelが開ける状態にする）。
+        // ブラウザからOSの既定アプリを直接起動することはできないため、ここまでが自動でできる範囲。
+        const blob = new Blob([outBuf], { type: "application/vnd.ms-excel.sheet.macroEnabled.12" });
+        const url = URL.createObjectURL(blob);
+        const a = el("a", { href: url, download: fname });
+        document.body.append(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        flash(`見積もり依頼を保存しました：${connectedName}${names.length ? "/" + names.join("/") : ""}/${fname}（ダウンロードからも開けます）`);
+        closeModal();
+      } catch (e) {
+        err.textContent = "出力に失敗しました：" + (e && e.message ? e.message : String(e));
+      }
+      genBtn.disabled = false;
+    } }, "Excelを作成して保存");
+    body.append(el("div", { class: "modal-actions" }, genBtn), err);
+    openModal("見積もり依頼を出力", body);
+  }
+
+  // デザインチーム共有用のDM施策サマリーExcel出力（保存先フォルダは持たず、ブラウザダウンロードのみ）
+  function openMeasuresExport() {
+    if (!state.model) { alert("対象月を選んでください。"); return; }
+    const rows = state.model.active.filter(m => m.baseName && m.baseName.trim() && !m.cancelled);
+    if (!rows.length) { alert("出力対象の施策がありません。"); return; }
+    window.MeasuresExport.build({ rows }).then(buf => {
+      const fname = window.MeasuresExport.filename(state.month);
+      const blob = new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const url = URL.createObjectURL(blob);
+      const a = el("a", { href: url, download: fname });
+      document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      flash(`施策サマリーを出力しました（ダウンロードから開けます）：${fname}`);
+    }).catch(e => alert("出力に失敗しました：" + (e && e.message ? e.message : String(e))));
+  }
+
+  function startPolling() {
+    if (state.pollTimer) clearInterval(state.pollTimer);
+    state.pollTimer = setInterval(async () => {
+      if (!state.month) return; await renderLockBar();
+      if (state.editing) return;
+      const mt = await S.monthMtime(state.month);
+      if (mt && mt !== state.mtime) {
+        const fresh = normalize((await S.readMonth(state.month)) || state.model);
+        syncObjectInPlace(state.model, fresh);   // 参照を保ったまま最新内容へ
+        state.baseline = JSON.parse(JSON.stringify(state.model));
+        state.mtime = mt; autoRefresh("full"); flash("最新の内容に更新しました");
+      }
+    }, 5000);
+  }
+  let ft; function flash(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(ft); ft=setTimeout(()=>t.classList.remove("show"),2000); }
+  // 編集不可の操作をブロックした時の案内。原因が「お名前未入力」なら、そこを直接示して迷わないようにする
+  // （名前が空のままだとenableEditing()が編集可能化を一切行わないため、単に「編集モードにしてください」だけでは
+  // 何をすればいいか伝わらず、詰まって動けなくなっているように見えるという報告があった）
+  function blockEdit() {
+    if (state.editing) return;
+    if (!state.user) {
+      flash("画面右上の「お名前」を入力すると編集できます");
+      const u = $("#userName");
+      if (u) { u.focus(); u.classList.add("nudge"); setTimeout(() => u.classList.remove("nudge"), 1500); }
+    } else {
+      flash("編集モードにしてから操作してください");
+    }
+  }
+
+  async function init() {
+    dl("dl-own", getOwners());
+    dl("dl-base", ["お誕生日","TRS下取","TRS下取りお誕生日","TRS下取WOW","RAH買い替え","RAH買い替えお誕生日","複数掲載","お誕生日ベースTRS下取り"]);
+    dl("dl-prod", M.products);
+    renderHeader();
+    // 担当を手入力で確定したら候補に自動追加
+    $("#board").addEventListener("change", e => { const t = e.target; if (t && t.getAttribute && t.getAttribute("data-field") === "owner") addOwner(t.value); });
+    $("#userName").addEventListener("change", e => { state.user = e.target.value.trim(); localStorage.setItem("dmplan:user", state.user); enableEditing(); });
+    $("#connectBtn").addEventListener("click", async () => {
+      try {
+        await S.connectFolder(); renderHeader(); await renderMonthSelect(); flash("共有フォルダに接続しました");
+        const ms = await S.listMonths();
+        if (ms.length) { $("#monthSelect").value = ms[0]; await loadMonth(ms[0]); } else { renderBody(); renderLockBar(); }
+      } catch (e) { alert(e.message); }
+    });
+    $("#monthSelect").addEventListener("change", e => e.target.value && loadMonth(e.target.value));
+    $("#newMonthBtn").addEventListener("click", newMonth);
+    $("#estimateBtn").addEventListener("click", openEstimateModal);
+    $("#measuresBtn").addEventListener("click", openMeasuresExport);
+    $("#mailDate").addEventListener("change", e => {
+      if (!state.editing || !state.model) return;
+      state.model.mailDate = e.target.value; markDirty();
+    });
+    if (S.estTryRestore) S.estTryRestore();
+    // Cover Flow（月めくり）
+    $("#cfBtn").addEventListener("click", () => openCoverflow(false));
+    $("#cfClose").addEventListener("click", closeCoverflow);
+    $("#coverflow").addEventListener("click", e => { if (e.target.id === "coverflow") closeCoverflow(); });
+    // 「月をめくる」の枠の外側をクリックしたら閉じる（ドラッグ移動中は除く）
+    document.addEventListener("mousedown", e => {
+      const ov = $("#coverflow");
+      if (!ov || !ov.classList.contains("open")) return;
+      if (state.draggingMeasure || cf.dragMode) return;
+      if (ov.contains(e.target)) return;
+      if (e.target.closest && e.target.closest("#cfBtn")) return;
+      closeCoverflow();
+    });
+    // ドラッグ中に上部ホットゾーンへ入ると Cover Flow を開く（別月へドロップ）。再入場でキャンセルを解除
+    $("#cfHot").addEventListener("dragover", e => { if (state.draggingMeasure) { e.preventDefault(); state.dragCanceled = false; openCoverflow(true); } });
+    $("#cfHot").addEventListener("dragenter", e => { if (state.draggingMeasure) e.preventDefault(); });
+    // Cover Flow を開いてドラッグ中に、その枠の外へ出たら「移動をやめる」（枠外ドロップ＝キャンセル）
+    document.addEventListener("dragover", e => {
+      if (!cf.dragMode) return;
+      const ov = $("#coverflow"); if (!ov || !ov.classList.contains("open")) return;
+      const r = ov.getBoundingClientRect(); const pad = 24;
+      const inside = e.clientX >= r.left - pad && e.clientX <= r.right + pad && e.clientY >= r.top - pad && e.clientY <= r.bottom + pad;
+      if (!inside) { if (!state.dragCanceled) { state.dragCanceled = true; flash("枠の外に出たので、移動をやめました（元の場所のまま）"); } closeCoverflow(); cf.dragMode = false; }
+    });
+    // ステージのドラッグscrub / キー操作（施策ドラッグ中はscrubしない）
+    (() => {
+      const st = $("#cfStage"); let down = false, sx = 0, ss = 0;
+      st.addEventListener("pointerdown", e => { if (state.draggingMeasure || e.target.closest(".cf-open")) return; down = true; sx = e.clientX; ss = cf.sel; st.setPointerCapture(e.pointerId); });
+      st.addEventListener("pointermove", e => { if (!down) return; const d = Math.round((sx - e.clientX) / 58); const ns = Math.max(0, Math.min(cf.data.length - 1, ss + d)); if (ns !== cf.sel) { cf.sel = ns; positionCF(); } });
+      st.addEventListener("pointerup", () => { down = false; });
+      st.addEventListener("keydown", e => { if (e.key === "ArrowLeft" && cf.sel > 0) { cf.sel--; positionCF(); } if (e.key === "ArrowRight" && cf.sel < cf.data.length - 1) { cf.sel++; positionCF(); } if (e.key === "Enter" && cf.data[cf.sel]) selectMonthFromCF(cf.data[cf.sel].month); if (e.key === "Escape") closeCoverflow(); });
+      st.addEventListener("wheel", e => { e.preventDefault(); if (e.deltaY > 0 && cf.sel < cf.data.length - 1) { cf.sel++; positionCF(); } else if (e.deltaY < 0 && cf.sel > 0) { cf.sel--; positionCF(); } }, { passive: false });
+    })();
+    document.querySelectorAll(".sg-tab").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
+    $("#board").addEventListener("input", onInput);
+    // 自動保存：フィールド編集を検知して保存予約
+    $("#board").addEventListener("input", markDirty);
+    $("#board").addEventListener("change", markDirty);
+    // Enterで真下の同じ列へ移動（表計算風）
+    $("#board").addEventListener("keydown", e => {
+      if (e.key !== "Enter" || e.isComposing) return;
+      const t = e.target;
+      if (!t.matches || !t.matches("input") || t.type === "date") return;
+      const td = t.closest("td"), tr = t.closest("tr[data-row]"); if (!td || !tr) return;
+      const idx = [...tr.children].indexOf(td);
+      let next = tr.nextElementSibling;
+      while (next && !next.matches("tr[data-row]")) next = next.nextElementSibling;
+      if (!next || !next.children[idx]) return;
+      const inp = next.children[idx].querySelector("input, select");
+      if (inp) { e.preventDefault(); inp.focus(); try { inp.select && inp.select(); } catch (_) {} }
+    });
+    // 日本語入力の変換中は自動再描画を保留し、入力欄から離れたら保留分を反映する
+    document.addEventListener("compositionstart", () => { imeComposing = true; });
+    document.addEventListener("compositionend", () => { imeComposing = false; flushAutoRefresh(); });
+    document.addEventListener("focusout", flushAutoRefresh);
+    // チェック欄のドラッグ選択：マウスボタンを離したら終了
+    document.addEventListener("mouseup", () => { state.dragCheckOn = null; state.crossDragCheckOn = null; document.body.classList.remove("no-usersel"); });
+    // 保存は「保存」ボタンとCtrl+Sだけ（入力中に勝手に保存して取りこぼすのを避けるため）
+    $("#saveBtn").addEventListener("click", () => saveNow(true));
+    $("#undoBtn").addEventListener("click", undoEdit);
+    document.addEventListener("keydown", e => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      const k = e.key.toLowerCase();
+      if (k === "s") { e.preventDefault(); saveNow(true); return; }
+      // 入力欄の中では、その欄の文字を戻すブラウザ本来のCtrl+Zに任せる（欄の外なら編集そのものを1つ戻す）
+      const a = document.activeElement;
+      const inField = a && (a.tagName === "INPUT" || a.tagName === "TEXTAREA");
+      if (inField) return;
+      if (k === "z" && !e.shiftKey) { e.preventDefault(); undoEdit(); return; }
+      if (k === "y" || (k === "z" && e.shiftKey)) { e.preventDefault(); redoEdit(); }
+    });
+    // 閉じる直前：未保存があれば確認ダイアログで引き止める（保存せずに閉じると失われるため）
+    window.addEventListener("beforeunload", (e) => {
+      if (!state.editing) return;
+      if (hasUnsaved() || saving) { e.preventDefault(); e.returnValue = ""; return ""; }
+      S.clearLock(state.month);
+    });
+    if (S.supported) { try { await S.tryRestore(); renderHeader(); } catch (e) {} }
+    await renderMonthSelect();
+    if (S.isConnected()) {
+      const months = await S.listMonths();
+      // 「月をめくる」→別ウィンドウで開く、で指定された月があればそれを開く（無ければ最新月）
+      const urlParams = new URLSearchParams(location.search);
+      const wanted = urlParams.get("month");
+      const target = (wanted && months.includes(wanted)) ? wanted : months[0];
+      if (target) {
+        $("#monthSelect").value = target; await loadMonth(target);
+        // 別ウィンドウで開いたときに引き継いだフィルターを反映
+        const filtersParam = urlParams.get("filters");
+        if (filtersParam) { try { state.filters = JSON.parse(filtersParam); rerender(); } catch (e) {} }
+      } else { renderBody(); renderLockBar(); }
+    } else { renderBody(); renderLockBar(); }
+  }
+  document.addEventListener("DOMContentLoaded", init);
+})();
